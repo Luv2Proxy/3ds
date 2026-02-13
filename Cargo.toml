@@ -1,0 +1,11 @@
+[package]
+name = "emulator3ds"
+version = "0.1.0"
+edition = "2024"
+description = "WASM-ready Nintendo 3DS emulator core framework"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
