@@ -364,7 +364,7 @@ impl Arm11Cpu {
         if va & 3 != 0 {
             return Err(FaultKind::Alignment);
         }
-        let pa = self.translate_va(memory, va, MemoryAccessKind::Execute)?;
+        let pa = self.translate_instruction_va(memory, va)?;
         memory
             .read_u32_checked(pa)
             .map_err(|_| FaultKind::Translation)
@@ -378,10 +378,33 @@ impl Arm11Cpu {
         if va & 1 != 0 {
             return Err(FaultKind::Alignment);
         }
-        let pa = self.translate_va(memory, va, MemoryAccessKind::Execute)?;
-        let lo = memory.read_u8(pa);
-        let hi = memory.read_u8(pa.wrapping_add(1));
+        let pa = self.translate_instruction_va(memory, va)?;
+        let lo = memory
+            .read_u8_checked(pa)
+            .map_err(|_| FaultKind::Translation)?;
+        let hi = memory
+            .read_u8_checked(pa.wrapping_add(1))
+            .map_err(|_| FaultKind::Translation)?;
         Ok(u16::from_le_bytes([lo, hi]))
+    }
+
+    fn translate_instruction_va(
+        &mut self,
+        memory: &Memory,
+        va: u32,
+    ) -> std::result::Result<u32, FaultKind> {
+        self.mmu
+            .translate_instruction(memory, va, self.is_privileged())
+            .map_err(|err| {
+                let kind = Self::fault_kind_from_error(err);
+                self.last_mmu_fault = Some(MmuFaultDetail {
+                    va,
+                    pa: None,
+                    access: MemoryAccessKind::Execute,
+                    kind,
+                });
+                kind
+            })
     }
 
     fn translate_va(
@@ -390,18 +413,24 @@ impl Arm11Cpu {
         va: u32,
         access: MemoryAccessKind,
     ) -> std::result::Result<u32, FaultKind> {
-        self.mmu
-            .translate(memory, va, access.clone(), self.is_privileged())
-            .map_err(|err| {
-                let kind = Self::fault_kind_from_error(err.clone());
-                self.last_mmu_fault = Some(MmuFaultDetail {
-                    va,
-                    pa: None,
-                    access,
-                    kind,
-                });
-                kind
-            })
+        let translated = match access {
+            MemoryAccessKind::Read => self.mmu.translate_read(memory, va, self.is_privileged()),
+            MemoryAccessKind::Write => self.mmu.translate_write(memory, va, self.is_privileged()),
+            MemoryAccessKind::Execute => {
+                self.mmu
+                    .translate_instruction(memory, va, self.is_privileged())
+            }
+        };
+        translated.map_err(|err| {
+            let kind = Self::fault_kind_from_error(err);
+            self.last_mmu_fault = Some(MmuFaultDetail {
+                va,
+                pa: None,
+                access,
+                kind,
+            });
+            kind
+        })
     }
 
     fn fault_kind_from_error(err: EmulatorError) -> FaultKind {
@@ -1076,7 +1105,7 @@ impl Arm11Cpu {
     }
 
     fn take_data_abort(&mut self, fault: FaultKind, pc: u32, opcode: u32) {
-        self.cp15_regs[CP15_DFAR] = self.regs[PC_INDEX];
+        self.cp15_regs[CP15_DFAR] = self.last_mmu_fault.map(|f| f.va).unwrap_or(pc);
         self.cp15_regs[CP15_DFSR] = self.encode_fault_status(fault);
         self.take_exception(ExceptionKind::DataAbort(fault), pc, opcode, false);
     }
@@ -1203,6 +1232,59 @@ mod tests {
         cpu.regs[0] = 0x0000_8000;
         cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory);
         assert_eq!(cpu.mmu.tlb_len(), 0);
+    }
+
+    #[test]
+    fn write_to_apx_read_only_section_routes_to_data_abort() {
+        let mut cpu = Arm11Cpu::new();
+        let mut memory = Memory::new();
+        memory
+            .write_u32_checked(0x0000_4000, (1 << 15) | (0b11 << 10) | 0b10)
+            .unwrap_or_else(|e| panic!("descriptor write: {e}"));
+        memory
+            .write_u32_checked(0x0000_4004, 0x0010_0000 | (0b11 << 10) | 0b10)
+            .unwrap_or_else(|e| panic!("descriptor write: {e}"));
+        memory.write_u32(0x0010_0000, 0xE5801000); // str r1, [r0]
+
+        cpu.regs[0] = 0x0000_4000;
+        cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory);
+        cpu.regs[0] = 0b01;
+        cpu.exec_coprocessor(mcr_cp15(3, 0, 0, 0), &mut memory);
+        cpu.regs[0] = 1;
+        cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory);
+
+        cpu.regs[PC_INDEX] = 0x0010_0000;
+        cpu.regs[0] = 0;
+        cpu.regs[1] = 0x1122_3344;
+        cpu.step(&mut memory).expect("step must handle abort");
+
+        let ex = cpu.last_exception().expect("data abort raised");
+        assert_eq!(ex.kind, ExceptionKind::DataAbort(FaultKind::Permission));
+        assert_eq!(ex.vector, VECTOR_DABT);
+    }
+
+    #[test]
+    fn execute_never_section_routes_to_prefetch_abort_permission() {
+        let mut cpu = Arm11Cpu::new();
+        let mut memory = Memory::new();
+        memory
+            .write_u32_checked(0x0000_4000, 0x0800_0000 | (1 << 4) | (0b11 << 10) | 0b10)
+            .unwrap_or_else(|e| panic!("descriptor write: {e}"));
+        memory.write_u32(0x0800_0000, 0xE1A0_0000); // nop
+
+        cpu.regs[0] = 0x0000_4000;
+        cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory);
+        cpu.regs[0] = 0b01;
+        cpu.exec_coprocessor(mcr_cp15(3, 0, 0, 0), &mut memory);
+        cpu.regs[0] = 1;
+        cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory);
+
+        cpu.regs[PC_INDEX] = 0;
+        cpu.step(&mut memory).expect("step must handle abort");
+
+        let ex = cpu.last_exception().expect("prefetch abort raised");
+        assert_eq!(ex.kind, ExceptionKind::PrefetchAbort(FaultKind::Permission));
+        assert_eq!(ex.vector, VECTOR_PABT);
     }
 
     #[test]

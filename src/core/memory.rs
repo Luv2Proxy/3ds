@@ -102,7 +102,7 @@ impl Memory {
             .position(|segment| segment.contains(addr))
     }
 
-    fn read_u8_checked(&self, addr: u32) -> Result<u8> {
+    pub(crate) fn read_u8_checked(&self, addr: u32) -> Result<u8> {
         let idx = self
             .find_segment_index(addr)
             .ok_or(EmulatorError::MemoryOutOfBounds { address: addr })?;
@@ -115,7 +115,7 @@ impl Memory {
             .ok_or(EmulatorError::MemoryOutOfBounds { address: addr })
     }
 
-    fn write_u8_checked(&mut self, addr: u32, value: u8) -> Result<()> {
+    pub(crate) fn write_u8_checked(&mut self, addr: u32, value: u8) -> Result<()> {
         let idx = self
             .find_segment_index(addr)
             .ok_or(EmulatorError::MemoryOutOfBounds { address: addr })?;
