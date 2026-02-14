@@ -1,4 +1,8 @@
 use super::cpu::{Arm11Cpu, CpuException, CpuRunState, ExceptionKind};
+use super::diagnostics::{
+    BootCheckpoint, BootCheckpointProfiler, BootCheckpointSnapshot, FaultSnapshot, RingBuffer,
+    StructuredError, TraceCategory, TracePayload, TraceRecord,
+};
 use super::dma::{DmaEngine, DmaTransfer, DmaTransferKind};
 use super::dsp::Dsp;
 use super::error::{EmulatorError, Result};
@@ -42,6 +46,14 @@ pub struct Emulator3ds {
     config: EmulatorConfig,
     frame_callbacks: u64,
     audio_callbacks: u64,
+    cpu_trace: RingBuffer<TraceRecord>,
+    ipc_trace: RingBuffer<TraceRecord>,
+    service_trace: RingBuffer<TraceRecord>,
+    mmu_fault_trace: RingBuffer<TraceRecord>,
+    gpu_trace: RingBuffer<TraceRecord>,
+    fault_snapshots: RingBuffer<FaultSnapshot>,
+    boot_profiler: BootCheckpointProfiler,
+    last_gpu_trace_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +95,14 @@ impl Emulator3ds {
             config,
             frame_callbacks: 0,
             audio_callbacks: 0,
+            cpu_trace: RingBuffer::new(512),
+            ipc_trace: RingBuffer::new(256),
+            service_trace: RingBuffer::new(256),
+            mmu_fault_trace: RingBuffer::new(128),
+            gpu_trace: RingBuffer::new(512),
+            fault_snapshots: RingBuffer::new(128),
+            boot_profiler: BootCheckpointProfiler::new(),
+            last_gpu_trace_len: 0,
         }
     }
 
@@ -98,6 +118,7 @@ impl Emulator3ds {
         self.vfs = VirtualFileSystem::default();
         self.frame_callbacks = 0;
         self.audio_callbacks = 0;
+        self.clear_diagnostics();
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
@@ -112,8 +133,11 @@ impl Emulator3ds {
         self.timing.reset();
         self.frame_callbacks = 0;
         self.audio_callbacks = 0;
+        self.clear_diagnostics();
         self.rom_loaded = true;
         self.schedule_boot_events();
+        self.boot_profiler
+            .mark(BootCheckpoint::RomLoaded, self.scheduler.cycles());
         Ok(())
     }
 
@@ -155,6 +179,36 @@ impl Emulator3ds {
         });
         self.scheduler
             .schedule_in(latency, ScheduledDeviceEvent::DmaCompletion { channel });
+    }
+
+    fn clear_diagnostics(&mut self) {
+        self.cpu_trace.clear();
+        self.ipc_trace.clear();
+        self.service_trace.clear();
+        self.mmu_fault_trace.clear();
+        self.gpu_trace.clear();
+        self.fault_snapshots.clear();
+        self.boot_profiler.reset();
+        self.last_gpu_trace_len = 0;
+    }
+
+    fn record_trace(&mut self, category: TraceCategory, payload: TracePayload) {
+        let cycle = self.scheduler.cycles();
+        let rec = TraceRecord { cycle, payload };
+        match category {
+            TraceCategory::CpuFetchDecode => self.cpu_trace.push(rec),
+            TraceCategory::Ipc => self.ipc_trace.push(rec),
+            TraceCategory::ServiceCall => self.service_trace.push(rec),
+            TraceCategory::MmuFault => self.mmu_fault_trace.push(rec),
+            TraceCategory::GpuCommand => self.gpu_trace.push(rec),
+        }
+    }
+
+    fn record_fault(&mut self, error: StructuredError) {
+        self.fault_snapshots.push(FaultSnapshot {
+            cycle: self.scheduler.cycles(),
+            error,
+        });
     }
 
     fn schedule_boot_events(&mut self) {
@@ -204,10 +258,59 @@ impl Emulator3ds {
             }
 
             let consumed = self.cpu.step(&mut self.memory)?;
+            if let Some(entry) = self.cpu.take_last_instruction_trace() {
+                self.record_trace(
+                    TraceCategory::CpuFetchDecode,
+                    TracePayload::CpuFetchDecode {
+                        pc: entry.pc,
+                        opcode: entry.opcode,
+                        thumb: entry.thumb,
+                    },
+                );
+                self.boot_profiler
+                    .mark(BootCheckpoint::FirstInstruction, self.scheduler.cycles());
+            }
             self.scheduler.tick(consumed);
             self.kernel.tick(consumed);
             let timing_tick = self.timing.tick(consumed);
             self.kernel.pump_ipc_events(1);
+            if let Some((command_id, handle_id, result_code)) = self.kernel.take_last_ipc_dispatch()
+            {
+                self.record_trace(
+                    TraceCategory::Ipc,
+                    TracePayload::Ipc {
+                        command_id,
+                        handle_id,
+                        result_code,
+                    },
+                );
+                self.boot_profiler
+                    .mark(BootCheckpoint::FirstIpcDispatch, self.scheduler.cycles());
+                if result_code != 0 {
+                    let err = StructuredError::ServiceCallFailure {
+                        pc: self.cpu.pc(),
+                        service_command_id: command_id,
+                        handle_id,
+                        result_code,
+                    };
+                    self.record_fault(err.clone());
+                    self.kernel.report_error(err);
+                    return Err(EmulatorError::ServiceCallError {
+                        pc: self.cpu.pc(),
+                        service_command_id: command_id,
+                        handle_id,
+                        result_code,
+                    });
+                }
+            }
+            if let Some(imm24) = self.kernel.take_last_service_imm24() {
+                self.record_trace(
+                    TraceCategory::ServiceCall,
+                    TracePayload::ServiceCall { imm24 },
+                );
+                self.boot_profiler
+                    .mark(BootCheckpoint::FirstServiceCall, self.scheduler.cycles());
+            }
 
             for event in self.scheduler.drain_due_events() {
                 self.handle_scheduled_event(event);
@@ -217,11 +320,29 @@ impl Emulator3ds {
                 self.gpu.enqueue_gsp_fifo_words(&fifo_words);
             }
             self.gpu.tick(self.scheduler.cycles());
+            let new_gpu_writes: Vec<_> = self
+                .gpu
+                .trace()
+                .iter()
+                .skip(self.last_gpu_trace_len)
+                .map(|w| (w.reg, w.value))
+                .collect();
+            for (reg, value) in new_gpu_writes {
+                self.record_trace(
+                    TraceCategory::GpuCommand,
+                    TracePayload::GpuCommand { reg, value },
+                );
+                self.boot_profiler
+                    .mark(BootCheckpoint::FirstGpuCommand, self.scheduler.cycles());
+            }
+            self.last_gpu_trace_len = self.gpu.trace().len();
             if timing_tick.video_frames > 0 {
                 self.gpu.present(timing_tick.video_frames);
                 self.frame_callbacks = self
                     .frame_callbacks
                     .saturating_add(timing_tick.video_frames);
+                self.boot_profiler
+                    .mark(BootCheckpoint::FirstFramePresent, self.scheduler.cycles());
             }
             if timing_tick.audio_samples > 0 {
                 self.dsp.produce_samples(timing_tick.audio_samples);
@@ -237,7 +358,54 @@ impl Emulator3ds {
                 self.kernel.handle_swi(exception.fault_opcode & 0x00FF_FFFF);
             }
 
+            if let Some(fault) = self.cpu.take_last_mmu_fault() {
+                self.record_trace(
+                    TraceCategory::MmuFault,
+                    TracePayload::MmuFault {
+                        va: fault.va,
+                        pa: fault.pa,
+                        access: fault.access,
+                    },
+                );
+                let err = StructuredError::MmuFault {
+                    pc: self.cpu.pc(),
+                    va: fault.va,
+                    pa: fault.pa,
+                    access: fault.access,
+                };
+                self.record_fault(err);
+                return Err(match fault.kind {
+                    super::cpu::FaultKind::Translation => EmulatorError::MmuTranslationFault {
+                        pc: self.cpu.pc(),
+                        va: fault.va,
+                        pa: fault.pa,
+                        access: fault.access,
+                    },
+                    super::cpu::FaultKind::Domain => EmulatorError::MmuDomainFault {
+                        pc: self.cpu.pc(),
+                        va: fault.va,
+                        pa: fault.pa,
+                        domain: 0,
+                        access: fault.access,
+                    },
+                    super::cpu::FaultKind::Permission => EmulatorError::MmuPermissionFault {
+                        pc: self.cpu.pc(),
+                        va: fault.va,
+                        pa: fault.pa,
+                        access: fault.access,
+                    },
+                    super::cpu::FaultKind::Alignment => EmulatorError::AlignmentFault {
+                        pc: self.cpu.pc(),
+                        va: fault.va,
+                        pa: fault.pa,
+                        access: fault.access,
+                    },
+                });
+            }
+
             if self.cpu.run_state() == CpuRunState::Halted {
+                self.boot_profiler
+                    .mark(BootCheckpoint::CpuHalted, self.scheduler.cycles());
                 break;
             }
         }
@@ -324,6 +492,44 @@ impl Emulator3ds {
             last_exception: self.cpu.last_exception(),
             service_calls: self.kernel.service_call_count(),
         }
+    }
+
+    pub fn recent_trace_slice(&self, category: TraceCategory, limit: usize) -> Vec<TraceRecord> {
+        match category {
+            TraceCategory::CpuFetchDecode => self.cpu_trace.recent(limit),
+            TraceCategory::Ipc => self.ipc_trace.recent(limit),
+            TraceCategory::ServiceCall => self.service_trace.recent(limit),
+            TraceCategory::MmuFault => self.mmu_fault_trace.recent(limit),
+            TraceCategory::GpuCommand => self.gpu_trace.recent(limit),
+        }
+    }
+
+    pub fn recent_fault_snapshots(&self, limit: usize) -> Vec<FaultSnapshot> {
+        self.fault_snapshots.recent(limit)
+    }
+
+    pub fn boot_checkpoint_snapshot(&self) -> BootCheckpointSnapshot {
+        self.boot_profiler.snapshot()
+    }
+
+    pub fn diagnostics_json(&self) -> String {
+        let checkpoints = self.boot_checkpoint_snapshot();
+        format!(
+            r#"{{"cpu_trace":{},"ipc_trace":{},"service_trace":{},"mmu_fault_trace":{},"gpu_trace":{},"fault_snapshots":{},"boot_events":{},"boot_divergence_at":{}}}"#,
+            self.recent_trace_slice(TraceCategory::CpuFetchDecode, 32)
+                .len(),
+            self.recent_trace_slice(TraceCategory::Ipc, 32).len(),
+            self.recent_trace_slice(TraceCategory::ServiceCall, 32)
+                .len(),
+            self.recent_trace_slice(TraceCategory::MmuFault, 32).len(),
+            self.recent_trace_slice(TraceCategory::GpuCommand, 32).len(),
+            self.recent_fault_snapshots(16).len(),
+            checkpoints.events.len(),
+            checkpoints
+                .divergence_at
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        )
     }
 
     pub fn state_json(&self) -> String {

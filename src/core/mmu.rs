@@ -98,7 +98,12 @@ impl Mmu {
             let descriptor = memory.read_u32_checked(desc_addr)?;
 
             if descriptor & SECTION_DESCRIPTOR_MASK != SECTION_DESCRIPTOR_VALUE {
-                return Err(EmulatorError::MmuTranslationFault { va, access });
+                return Err(EmulatorError::MmuTranslationFault {
+                    pc: 0,
+                    va,
+                    pa: None,
+                    access,
+                });
             }
 
             let entry = TlbEntry {
@@ -125,7 +130,9 @@ impl Mmu {
         match domain_mode {
             0b00 | 0b10 => {
                 return Err(EmulatorError::MmuDomainFault {
+                    pc: 0,
                     va,
+                    pa: None,
                     domain: entry.domain,
                     access,
                 });
@@ -146,7 +153,12 @@ impl Mmu {
         };
 
         if !allowed {
-            return Err(EmulatorError::MmuPermissionFault { va, access });
+            return Err(EmulatorError::MmuPermissionFault {
+                pc: 0,
+                va,
+                pa: None,
+                access,
+            });
         }
 
         Ok(())
@@ -195,7 +207,9 @@ mod tests {
         assert_eq!(
             err,
             EmulatorError::MmuTranslationFault {
+                pc: 0,
                 va: 0x0020_0000,
+                pa: None,
                 access: MemoryAccessKind::Read,
             }
         );
@@ -220,7 +234,9 @@ mod tests {
         assert_eq!(
             user_err,
             EmulatorError::MmuPermissionFault {
+                pc: 0,
                 va: 0x0000_1000,
+                pa: None,
                 access: MemoryAccessKind::Read,
             }
         );

@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryAccessKind {
     Read,
     Write,
@@ -27,21 +27,35 @@ pub enum EmulatorError {
     InvalidRomLayout,
     InvalidExHeader,
     MmuTranslationFault {
+        pc: u32,
         va: u32,
+        pa: Option<u32>,
         access: MemoryAccessKind,
     },
     MmuDomainFault {
+        pc: u32,
         va: u32,
+        pa: Option<u32>,
         domain: u8,
         access: MemoryAccessKind,
     },
     MmuPermissionFault {
+        pc: u32,
         va: u32,
+        pa: Option<u32>,
         access: MemoryAccessKind,
     },
     AlignmentFault {
+        pc: u32,
         va: u32,
+        pa: Option<u32>,
         access: MemoryAccessKind,
+    },
+    ServiceCallError {
+        pc: u32,
+        service_command_id: u16,
+        handle_id: u32,
+        result_code: u32,
     },
 }
 
@@ -63,18 +77,44 @@ impl Display for EmulatorError {
             Self::InvalidTitlePackage => write!(f, "invalid title package format"),
             Self::InvalidRomLayout => write!(f, "invalid NCSD/NCCH ROM layout"),
             Self::InvalidExHeader => write!(f, "invalid NCCH exheader format"),
-            Self::MmuTranslationFault { va, access } => {
-                write!(f, "MMU translation fault at VA=0x{va:08x} ({access:?})")
+            Self::MmuTranslationFault { pc, va, pa, access } => {
+                write!(
+                    f,
+                    "MMU translation fault at PC=0x{pc:08x}, VA=0x{va:08x}, PA={pa:?} ({access:?})"
+                )
             }
-            Self::MmuDomainFault { va, domain, access } => write!(
+            Self::MmuDomainFault {
+                pc,
+                va,
+                pa,
+                domain,
+                access,
+            } => write!(
                 f,
-                "MMU domain fault at VA=0x{va:08x}, domain={domain} ({access:?})"
+                "MMU domain fault at PC=0x{pc:08x}, VA=0x{va:08x}, PA={pa:?}, domain={domain} ({access:?})"
             ),
-            Self::MmuPermissionFault { va, access } => {
-                write!(f, "MMU permission fault at VA=0x{va:08x} ({access:?})")
+            Self::MmuPermissionFault { pc, va, pa, access } => {
+                write!(
+                    f,
+                    "MMU permission fault at PC=0x{pc:08x}, VA=0x{va:08x}, PA={pa:?} ({access:?})"
+                )
             }
-            Self::AlignmentFault { va, access } => {
-                write!(f, "alignment fault at VA=0x{va:08x} ({access:?})")
+            Self::AlignmentFault { pc, va, pa, access } => {
+                write!(
+                    f,
+                    "alignment fault at PC=0x{pc:08x}, VA=0x{va:08x}, PA={pa:?} ({access:?})"
+                )
+            }
+            Self::ServiceCallError {
+                pc,
+                service_command_id,
+                handle_id,
+                result_code,
+            } => {
+                write!(
+                    f,
+                    "service call failure at PC=0x{pc:08x}, cmd=0x{service_command_id:04x}, handle={handle_id}, result=0x{result_code:08x}"
+                )
             }
         }
     }
