@@ -4,6 +4,7 @@ pub mod emulator;
 pub mod error;
 pub mod fs;
 pub mod kernel;
+pub mod loader;
 pub mod memory;
 pub mod pica;
 pub mod rom;
