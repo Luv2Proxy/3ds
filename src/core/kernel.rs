@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
+use super::fs::{ArchiveHandle, ArchiveId, FileHandle, VirtualFileSystem};
 use super::ipc::{
     CommandBuffer, CommandHeader, Handle, IpcPort, IpcSession, ProcessId, RESULT_INVALID_COMMAND,
     RESULT_INVALID_HANDLE, RESULT_NOT_FOUND, RESULT_OK, service_name_from_words,
@@ -30,12 +31,12 @@ enum ServiceTarget {
     GspGpu,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum KernelObject {
     Port(ServiceTarget),
     Session(ServiceTarget),
-    Archive(u32),
-    File(u32),
+    Archive(ArchiveHandle),
+    File(FileHandle),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,7 @@ pub struct Kernel {
     service_ports: HashMap<String, (ProcessId, Handle)>,
     app_state: u32,
     gpu_handoff: VecDeque<Vec<u32>>,
+    vfs: VirtualFileSystem,
 }
 
 impl Kernel {
@@ -74,6 +76,7 @@ impl Kernel {
         let mut kernel = Self {
             next_handle: 0x20,
             app_state: 1,
+            vfs: VirtualFileSystem::default(),
             ..Self::default()
         };
         kernel.ensure_process(KERNEL_PROCESS_ID);
@@ -96,6 +99,7 @@ impl Kernel {
         self.service_ports.clear();
         self.app_state = 1;
         self.gpu_handoff.clear();
+        self.vfs = VirtualFileSystem::default();
         self.ensure_process(KERNEL_PROCESS_ID);
         self.bootstrap_services(KERNEL_PROCESS_ID);
     }
@@ -219,6 +223,9 @@ impl Kernel {
         self.svc_log.len()
     }
 
+    pub fn mount_romfs(&mut self, romfs: super::fs::RomFs) {
+        self.vfs.mount_romfs(romfs);
+    }
     pub fn drain_gpu_handoff(&mut self) -> Vec<Vec<u32>> {
         self.gpu_handoff.drain(..).collect()
     }
@@ -233,7 +240,7 @@ impl Kernel {
     }
 
     fn lookup_object(&self, pid: ProcessId, handle: Handle) -> Option<KernelObject> {
-        self.processes.get(&pid)?.handles.get(&handle).copied()
+        self.processes.get(&pid)?.handles.get(&handle).cloned()
     }
 
     fn dispatch_request(&mut self, pid: ProcessId, req: IpcRequest) -> (u32, Vec<u32>) {
@@ -280,8 +287,11 @@ impl Kernel {
     fn dispatch_fs(&mut self, pid: ProcessId, cmd: CommandBuffer) -> (u32, Vec<u32>) {
         match cmd.header.command_id {
             0x0001 => {
-                let archive_id = cmd.words.first().copied().unwrap_or(0);
-                let archive = self.allocate_handle(pid, KernelObject::Archive(archive_id));
+                let archive_id = cmd.words.first().copied().unwrap_or(ArchiveId::Sdmc as u32);
+                let Some(archive_obj) = self.vfs.open_archive(archive_id) else {
+                    return (RESULT_NOT_FOUND, vec![]);
+                };
+                let archive = self.allocate_handle(pid, KernelObject::Archive(archive_obj));
                 (RESULT_OK, vec![archive])
             }
             0x0002 => {
@@ -289,14 +299,27 @@ impl Kernel {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
                 let archive_handle = cmd.words[0];
-                if !matches!(
-                    self.lookup_object(pid, archive_handle),
-                    Some(KernelObject::Archive(_))
-                ) {
+                let Some(KernelObject::Archive(archive_obj)) =
+                    self.lookup_object(pid, archive_handle)
+                else {
                     return (RESULT_INVALID_HANDLE, vec![]);
-                }
-                let file_id = cmd.words[1];
-                let file = self.allocate_handle(pid, KernelObject::File(file_id));
+                };
+                let translated = self
+                    .vfs
+                    .translate_path(archive_obj.archive, &format!("/{:08x}", cmd.words[1]));
+                let Some(file_obj) = self.vfs.open_file(archive_obj, &translated) else {
+                    if archive_obj.archive == ArchiveId::RomFs {
+                        return (RESULT_NOT_FOUND, vec![]);
+                    }
+                    let fallback_path = format!("/{:08x}", cmd.words[1]);
+                    let file_obj = self
+                        .vfs
+                        .open_file(archive_obj, &fallback_path)
+                        .expect("fallback open");
+                    let file = self.allocate_handle(pid, KernelObject::File(file_obj));
+                    return (RESULT_OK, vec![file]);
+                };
+                let file = self.allocate_handle(pid, KernelObject::File(file_obj));
                 (RESULT_OK, vec![file])
             }
             _ => (RESULT_INVALID_COMMAND, vec![]),
