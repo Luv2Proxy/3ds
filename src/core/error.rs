@@ -9,6 +9,8 @@ pub enum EmulatorError {
     InvalidInstruction { pc: u32, opcode: u32 },
     RomNotLoaded,
     InvalidTitlePackage,
+    InvalidRomLayout,
+    InvalidExHeader,
 }
 
 impl Display for EmulatorError {
@@ -27,6 +29,8 @@ impl Display for EmulatorError {
             }
             Self::RomNotLoaded => write!(f, "cannot execute because no ROM is loaded"),
             Self::InvalidTitlePackage => write!(f, "invalid title package format"),
+            Self::InvalidRomLayout => write!(f, "invalid NCSD/NCCH ROM layout"),
+            Self::InvalidExHeader => write!(f, "invalid NCCH exheader format"),
         }
     }
 }
