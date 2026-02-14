@@ -105,7 +105,6 @@ impl RomImage {
         &self.bytes
     }
 
-
     pub fn first_program(&self) -> Option<&NcchProgram> {
         self.partitions.first().map(|partition| &partition.program)
     }

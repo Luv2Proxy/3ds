@@ -3,6 +3,7 @@ pub mod dsp;
 pub mod emulator;
 pub mod error;
 pub mod fs;
+pub mod ipc;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
