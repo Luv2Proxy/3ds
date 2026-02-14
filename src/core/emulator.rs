@@ -10,7 +10,7 @@ use super::fs::TitlePackage;
 use super::fs::VirtualFileSystem;
 use super::irq::{IrqController, IrqLine};
 use super::kernel::{Kernel, ServiceEvent};
-use super::loader::load_process_with_fs_from_rom;
+use super::loader::{install_process_image, parse_process_image_from_rom};
 use super::memory::Memory;
 use super::pica::PicaGpu;
 use super::rom::RomImage;
@@ -124,9 +124,10 @@ impl Emulator3ds {
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
         RomImage::parse(rom, usize::MAX)?;
         self.memory.clear_writable();
-        let (metadata, vfs) = load_process_with_fs_from_rom(&mut self.memory, rom)?;
-        self.vfs = vfs;
-        self.cpu.reset(metadata.entrypoint);
+        let loaded = parse_process_image_from_rom(rom)?;
+        install_process_image(&mut self.memory, &loaded.boot);
+        self.vfs = loaded.vfs;
+        self.cpu.reset(loaded.boot.entrypoint);
         self.scheduler.reset();
         self.irq.reset();
         self.dma.reset();
