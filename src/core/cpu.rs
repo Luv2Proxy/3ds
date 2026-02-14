@@ -1,5 +1,7 @@
+use super::error::MemoryAccessKind;
 use super::error::Result;
 use super::memory::Memory;
+use super::mmu::Mmu;
 
 const REG_COUNT: usize = 16;
 const PC_INDEX: usize = 15;
@@ -48,6 +50,7 @@ pub struct Arm11Cpu {
     state: CpuRunState,
     last_exception: Option<CpuException>,
     cp15_regs: [u32; 16],
+    mmu: Mmu,
 }
 
 impl Default for Arm11Cpu {
@@ -66,6 +69,7 @@ impl Arm11Cpu {
             state: CpuRunState::Running,
             last_exception: None,
             cp15_regs: [0; 16],
+            mmu: Mmu::new(),
         }
     }
 
@@ -78,6 +82,7 @@ impl Arm11Cpu {
         self.state = CpuRunState::Running;
         self.last_exception = None;
         self.cp15_regs = [0; 16];
+        self.mmu.reset();
     }
 
     pub fn run_state(&self) -> CpuRunState {
@@ -106,7 +111,7 @@ impl Arm11Cpu {
         }
 
         let pc = self.pc();
-        let opcode = memory.read_u32_checked(pc)?;
+        let opcode = self.fetch_instruction(memory, pc)?;
         self.regs[PC_INDEX] = pc.wrapping_add(4);
 
         if !self.condition_passed(opcode >> 28) {
@@ -127,7 +132,7 @@ impl Arm11Cpu {
             return Ok(1);
         }
 
-        if self.exec_coprocessor(opcode) {
+        if self.exec_coprocessor(opcode, memory) {
             return Ok(2);
         }
 
@@ -157,6 +162,19 @@ impl Arm11Cpu {
         Ok(3)
     }
 
+    fn fetch_instruction(&mut self, memory: &Memory, va: u32) -> Result<u32> {
+        let pa = self.translate_va(memory, va, MemoryAccessKind::Execute)?;
+        memory.read_u32_checked(pa)
+    }
+
+    fn translate_va(&mut self, memory: &Memory, va: u32, access: MemoryAccessKind) -> Result<u32> {
+        self.mmu.translate(memory, va, access, self.is_privileged())
+    }
+
+    fn is_privileged(&self) -> bool {
+        self.mode() != MODE_USR
+    }
+
     fn exec_system(&mut self, opcode: u32) -> bool {
         // MRS CPSR/SPSR
         if opcode & 0x0FBF_0FFF == 0x010F_0000 {
@@ -182,18 +200,46 @@ impl Arm11Cpu {
         false
     }
 
-    fn exec_coprocessor(&mut self, opcode: u32) -> bool {
+    fn exec_coprocessor(&mut self, opcode: u32, _memory: &mut Memory) -> bool {
         // Very small MRC/MCR CP15 subset model.
         if (opcode & 0x0F00_0010) == 0x0E00_0010 {
             let cp_num = (opcode >> 8) & 0xF;
             let rd = ((opcode >> 12) & 0xF) as usize;
+            let crn = (opcode >> 16) & 0xF;
             let crm = opcode & 0xF;
+            let opc2 = (opcode >> 5) & 0x7;
+            let is_mrc = ((opcode >> 20) & 1) == 1;
+
             if cp_num == 15 {
                 let idx = usize::try_from(crm & 0xF).unwrap_or(0);
-                if ((opcode >> 20) & 1) == 1 {
-                    self.regs[rd] = self.cp15_regs[idx];
+                if is_mrc {
+                    self.regs[rd] = match (crn, crm, opc2) {
+                        (1, 0, 0) => self.cp15_regs[1],
+                        (2, 0, 0) => self.cp15_regs[2],
+                        (3, 0, 0) => self.cp15_regs[3],
+                        _ => self.cp15_regs[idx],
+                    };
                 } else {
-                    self.cp15_regs[idx] = self.regs[rd];
+                    let value = self.regs[rd];
+                    self.cp15_regs[idx] = value;
+                    match (crn, crm, opc2) {
+                        (1, 0, 0) => {
+                            self.cp15_regs[1] = value;
+                            self.mmu.write_control(value);
+                        }
+                        (2, 0, 0) => {
+                            self.cp15_regs[2] = value;
+                            self.mmu.write_ttbr0(value);
+                        }
+                        (3, 0, 0) => {
+                            self.cp15_regs[3] = value;
+                            self.mmu.write_dacr(value);
+                        }
+                        (8, 7, 0) | (8, 5, 0) | (8, 6, 0) => {
+                            self.mmu.invalidate_tlb();
+                        }
+                        _ => {}
+                    }
                 }
                 return true;
             }
@@ -260,9 +306,11 @@ impl Arm11Cpu {
 
         let address = if pre_index { effective } else { base };
         if load {
-            self.regs[rd] = memory.read_u32_checked(address)?;
+            let pa = self.translate_va(memory, address, MemoryAccessKind::Read)?;
+            self.regs[rd] = memory.read_u32_checked(pa)?;
         } else {
-            memory.write_u32_checked(address, self.regs[rd])?;
+            let pa = self.translate_va(memory, address, MemoryAccessKind::Write)?;
+            memory.write_u32_checked(pa, self.regs[rd])?;
         }
 
         if write_back || !pre_index {
@@ -524,5 +572,66 @@ impl Arm11Cpu {
             0xE => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::EmulatorError;
+
+    fn mcr_cp15(crn: u32, rd: usize, crm: u32, opc2: u32) -> u32 {
+        0xEE00_0010 | (crn << 16) | ((rd as u32) << 12) | (15 << 8) | (opc2 << 5) | crm
+    }
+
+    #[test]
+    fn instruction_fetch_faults_when_mmu_mapping_missing() {
+        let mut cpu = Arm11Cpu::new();
+        let mut memory = Memory::new();
+
+        cpu.regs[0] = 0x0000_4000;
+        assert!(cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory)); // TTBR0
+        cpu.regs[0] = 0b01;
+        assert!(cpu.exec_coprocessor(mcr_cp15(3, 0, 0, 0), &mut memory)); // DACR
+        cpu.regs[0] = 1;
+        assert!(cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory)); // SCTLR.M
+
+        cpu.regs[PC_INDEX] = 0x0010_0000;
+        let err = cpu
+            .step(&mut memory)
+            .err()
+            .unwrap_or_else(|| panic!("expected fetch fault"));
+        assert_eq!(
+            err,
+            EmulatorError::MmuTranslationFault {
+                va: 0x0010_0000,
+                access: MemoryAccessKind::Execute,
+            }
+        );
+    }
+
+    #[test]
+    fn mcr_ttbr_write_invalidates_cached_translation() {
+        let mut cpu = Arm11Cpu::new();
+        let mut memory = Memory::new();
+        memory
+            .write_u32_checked(0x0000_4000, 0x0800_0000 | (0b11 << 10) | 0b10)
+            .unwrap_or_else(|e| panic!("descriptor write: {e}"));
+
+        cpu.regs[0] = 0x0000_4000;
+        cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory);
+        cpu.regs[0] = 0b01;
+        cpu.exec_coprocessor(mcr_cp15(3, 0, 0, 0), &mut memory);
+        cpu.regs[0] = 1;
+        cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory);
+
+        cpu.mmu
+            .translate(&memory, 0x0000_1000, MemoryAccessKind::Read, true)
+            .unwrap_or_else(|e| panic!("initial translation: {e}"));
+        assert_eq!(cpu.mmu.tlb_len(), 1);
+
+        cpu.regs[0] = 0x0000_8000;
+        cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory);
+        assert_eq!(cpu.mmu.tlb_len(), 0);
     }
 }
