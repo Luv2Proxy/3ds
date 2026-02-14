@@ -2,8 +2,9 @@ use super::cpu::{Arm11Cpu, CpuException, CpuRunState, ExceptionKind};
 use super::dsp::Dsp;
 use super::error::{EmulatorError, Result};
 use super::fs::TitlePackage;
+use super::fs::VirtualFileSystem;
 use super::kernel::{Kernel, ServiceEvent};
-use super::loader::load_process_from_rom;
+use super::loader::load_process_with_fs_from_rom;
 use super::memory::Memory;
 use super::pica::PicaGpu;
 use super::rom::RomImage;
@@ -33,6 +34,7 @@ pub struct Emulator3ds {
     kernel: Kernel,
     timing: TimingModel,
     rom_loaded: bool,
+    vfs: VirtualFileSystem,
     config: EmulatorConfig,
 }
 
@@ -69,6 +71,7 @@ impl Emulator3ds {
             kernel: Kernel::new(),
             timing: TimingModel::new(),
             rom_loaded: false,
+            vfs: VirtualFileSystem::default(),
             config,
         }
     }
@@ -80,12 +83,14 @@ impl Emulator3ds {
         self.kernel.reset_runtime();
         self.cpu.reset(0);
         self.rom_loaded = false;
+        self.vfs = VirtualFileSystem::default();
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
         RomImage::parse(rom, usize::MAX)?;
         self.memory.clear_writable();
-        let metadata = load_process_from_rom(&mut self.memory, rom)?;
+        let (metadata, vfs) = load_process_with_fs_from_rom(&mut self.memory, rom)?;
+        self.vfs = vfs;
         self.cpu.reset(metadata.entrypoint);
         self.scheduler.reset();
         self.timing.reset();
@@ -241,12 +246,8 @@ mod tests {
         let ncch = 0x200;
         rom[ncch + 0x100..ncch + 0x104].copy_from_slice(b"NCCH");
         rom[ncch + 0x180..ncch + 0x184].copy_from_slice(&0x400u32.to_le_bytes());
-        rom[ncch + 0x190..ncch + 0x194].copy_from_slice(&3u32.to_le_bytes());
-        rom[ncch + 0x194..ncch + 0x198].copy_from_slice(&1u32.to_le_bytes());
-        rom[ncch + 0x198..ncch + 0x19C].copy_from_slice(&4u32.to_le_bytes());
-        rom[ncch + 0x19C..ncch + 0x1A0].copy_from_slice(&1u32.to_le_bytes());
-        rom[ncch + 0x1A0..ncch + 0x1A4].copy_from_slice(&5u32.to_le_bytes());
-        rom[ncch + 0x1A4..ncch + 0x1A8].copy_from_slice(&1u32.to_le_bytes());
+        rom[ncch + 0x1A8..ncch + 0x1AC].copy_from_slice(&3u32.to_le_bytes());
+        rom[ncch + 0x1AC..ncch + 0x1B0].copy_from_slice(&2u32.to_le_bytes());
 
         let ex = ncch + 0x200;
         rom[ex..ex + 4].copy_from_slice(&0x0010_0000u32.to_le_bytes());
@@ -260,6 +261,12 @@ mod tests {
         rom[ex + 0x1C..ex + 0x20].copy_from_slice(&0x2000u32.to_le_bytes());
         rom[ex + 0x40..ex + 0x44].copy_from_slice(&0x8000u32.to_le_bytes());
 
+        let exefs = 0x800;
+        rom[exefs..exefs + 5].copy_from_slice(b".code");
+        rom[exefs + 8..exefs + 12].copy_from_slice(&0u32.to_le_bytes());
+        rom[exefs + 12..exefs + 16].copy_from_slice(&0x60u32.to_le_bytes());
+        rom[exefs + 0x200..exefs + 0x260].fill(0);
+
         rom
     }
 
@@ -271,7 +278,7 @@ mod tests {
     fn wasm_memory_mapping_handles_high_rom_addresses() {
         let mut emu = Emulator3ds::new();
         let mut rom = valid_rom();
-        write_insn(&mut rom, 0x800, 0xE320_F003);
+        write_insn(&mut rom, 0xA00, 0xE320_F003);
         emu.load_rom(&rom)
             .unwrap_or_else(|e| panic!("load works: {e}"));
         emu.run_cycles(1)
@@ -284,8 +291,8 @@ mod tests {
     fn gpu_kernel_timing_and_fs_pipeline_work() {
         let mut emu = Emulator3ds::new();
         let mut rom = valid_rom();
-        write_insn(&mut rom, 0x800, 0xEF00_0000);
-        write_insn(&mut rom, 0x804, 0xE320_F003);
+        write_insn(&mut rom, 0xA00, 0xEF00_0000);
+        write_insn(&mut rom, 0xA04, 0xE320_F003);
 
         let mut pkg = vec![];
         pkg.extend_from_slice(b"3DST");

@@ -34,9 +34,8 @@ pub struct ExHeader {
 pub struct NcchProgram {
     pub entrypoint: u32,
     pub exheader: ExHeader,
-    pub text_region: RomRegion,
-    pub ro_region: RomRegion,
-    pub data_region: RomRegion,
+    pub exefs_region: RomRegion,
+    pub romfs_region: Option<RomRegion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,17 +138,29 @@ fn parse_ncch_program(raw: &[u8], ncch_offset: usize, ncch_size: usize) -> Resul
     let exheader = parse_exheader(exheader_bytes)?;
 
     let entrypoint = read_u32(exheader_bytes, 0x00)?;
-    let text_region = parse_section_region(header, ncch_offset, ncch_end, 0x190)?;
-    let ro_region = parse_section_region(header, ncch_offset, ncch_end, 0x198)?;
-    let data_region = parse_section_region(header, ncch_offset, ncch_end, 0x1A0)?;
+    let exefs_region = parse_section_region(header, ncch_offset, ncch_end, 0x1A8)?;
+    let romfs_region = parse_optional_section_region(header, ncch_offset, ncch_end, 0x1B0)?;
 
     Ok(NcchProgram {
         entrypoint,
         exheader,
-        text_region,
-        ro_region,
-        data_region,
+        exefs_region,
+        romfs_region,
     })
+}
+
+fn parse_optional_section_region(
+    ncch_header: &[u8],
+    ncch_offset: usize,
+    ncch_end: usize,
+    field_offset: usize,
+) -> Result<Option<RomRegion>> {
+    let offset_units = read_u32(ncch_header, field_offset)? as usize;
+    let size_units = read_u32(ncch_header, field_offset + 4)? as usize;
+    if offset_units == 0 || size_units == 0 {
+        return Ok(None);
+    }
+    parse_section_region(ncch_header, ncch_offset, ncch_end, field_offset).map(Some)
 }
 
 fn parse_section_region(
@@ -233,12 +244,8 @@ mod tests {
         let ncch_base = 0x200;
         rom[ncch_base + 0x100..ncch_base + 0x104].copy_from_slice(b"NCCH");
         rom[ncch_base + 0x180..ncch_base + 0x184].copy_from_slice(&0x400u32.to_le_bytes());
-        rom[ncch_base + 0x190..ncch_base + 0x194].copy_from_slice(&3u32.to_le_bytes());
-        rom[ncch_base + 0x194..ncch_base + 0x198].copy_from_slice(&1u32.to_le_bytes());
-        rom[ncch_base + 0x198..ncch_base + 0x19C].copy_from_slice(&4u32.to_le_bytes());
-        rom[ncch_base + 0x19C..ncch_base + 0x1A0].copy_from_slice(&1u32.to_le_bytes());
-        rom[ncch_base + 0x1A0..ncch_base + 0x1A4].copy_from_slice(&5u32.to_le_bytes());
-        rom[ncch_base + 0x1A4..ncch_base + 0x1A8].copy_from_slice(&1u32.to_le_bytes());
+        rom[ncch_base + 0x1A8..ncch_base + 0x1AC].copy_from_slice(&3u32.to_le_bytes());
+        rom[ncch_base + 0x1AC..ncch_base + 0x1B0].copy_from_slice(&1u32.to_le_bytes());
 
         let exheader = ncch_base + 0x200;
         rom[exheader..exheader + 4].copy_from_slice(&0x0010_1000u32.to_le_bytes());
@@ -272,8 +279,7 @@ mod tests {
         assert_eq!(program.entrypoint, 0x0010_1000);
         assert_eq!(program.exheader.text_address, 0x0010_0000);
         assert_eq!(program.exheader.service_access, vec!["fs:USER".to_string()]);
-        assert_eq!(program.text_region.offset, 0x800);
-        assert_eq!(program.ro_region.offset, 0xA00);
-        assert_eq!(program.data_region.offset, 0xC00);
+        assert_eq!(program.exefs_region.offset, 0x800);
+        assert_eq!(program.romfs_region, None);
     }
 }
