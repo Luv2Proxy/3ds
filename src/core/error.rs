@@ -39,6 +39,10 @@ pub enum EmulatorError {
         va: u32,
         access: MemoryAccessKind,
     },
+    AlignmentFault {
+        va: u32,
+        access: MemoryAccessKind,
+    },
 }
 
 impl Display for EmulatorError {
@@ -68,6 +72,9 @@ impl Display for EmulatorError {
             ),
             Self::MmuPermissionFault { va, access } => {
                 write!(f, "MMU permission fault at VA=0x{va:08x} ({access:?})")
+            }
+            Self::AlignmentFault { va, access } => {
+                write!(f, "alignment fault at VA=0x{va:08x} ({access:?})")
             }
         }
     }
