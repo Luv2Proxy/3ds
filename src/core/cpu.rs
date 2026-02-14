@@ -1,5 +1,6 @@
 use super::error::MemoryAccessKind;
 use super::error::Result;
+use super::irq::IrqLine;
 use super::memory::Memory;
 use super::mmu::Mmu;
 
@@ -11,15 +12,18 @@ const FLAG_N: u32 = 1 << 31;
 const FLAG_Z: u32 = 1 << 30;
 const FLAG_C: u32 = 1 << 29;
 const FLAG_V: u32 = 1 << 28;
+const FLAG_I: u32 = 1 << 7;
 
 const MODE_MASK: u32 = 0x1F;
 const MODE_USR: u32 = 0b1_0000;
 const MODE_UND: u32 = 0b1_1011;
 const MODE_SVC: u32 = 0b1_0011;
+const MODE_IRQ: u32 = 0b1_0010;
 
 const VECTOR_BASE: u32 = 0x0010_0000;
 const VECTOR_UND: u32 = VECTOR_BASE + 0x0000_0004;
 const VECTOR_SWI: u32 = VECTOR_BASE + 0x0000_0008;
+const VECTOR_IRQ: u32 = VECTOR_BASE + 0x0000_0018;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuRunState {
@@ -31,6 +35,7 @@ pub enum CpuRunState {
 pub enum ExceptionKind {
     UndefinedInstruction,
     SoftwareInterrupt,
+    Interrupt(IrqLine),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +52,7 @@ pub struct Arm11Cpu {
     cpsr: u32,
     spsr_und: u32,
     spsr_svc: u32,
+    spsr_irq: u32,
     state: CpuRunState,
     last_exception: Option<CpuException>,
     cp15_regs: [u32; 16],
@@ -66,6 +72,7 @@ impl Arm11Cpu {
             cpsr: MODE_USR,
             spsr_und: MODE_USR,
             spsr_svc: MODE_USR,
+            spsr_irq: MODE_USR,
             state: CpuRunState::Running,
             last_exception: None,
             cp15_regs: [0; 16],
@@ -79,6 +86,7 @@ impl Arm11Cpu {
         self.cpsr = MODE_USR;
         self.spsr_und = MODE_USR;
         self.spsr_svc = MODE_USR;
+        self.spsr_irq = MODE_USR;
         self.state = CpuRunState::Running;
         self.last_exception = None;
         self.cp15_regs = [0; 16];
@@ -103,6 +111,18 @@ impl Arm11Cpu {
 
     pub fn last_exception(&self) -> Option<CpuException> {
         self.last_exception
+    }
+
+    pub fn interrupts_enabled(&self) -> bool {
+        self.cpsr & FLAG_I == 0
+    }
+
+    pub fn enter_irq(&mut self, line: IrqLine) {
+        if self.state == CpuRunState::Halted {
+            self.state = CpuRunState::Running;
+        }
+        let pc = self.pc();
+        self.take_exception(ExceptionKind::Interrupt(line), pc, line as u32);
     }
 
     pub fn step(&mut self, memory: &mut Memory) -> Result<u32> {
@@ -515,6 +535,7 @@ impl Arm11Cpu {
         match self.mode() {
             MODE_UND => Some(self.spsr_und),
             MODE_SVC => Some(self.spsr_svc),
+            MODE_IRQ => Some(self.spsr_irq),
             _ => None,
         }
     }
@@ -529,17 +550,19 @@ impl Arm11Cpu {
         let (vector, mode) = match kind {
             ExceptionKind::UndefinedInstruction => (VECTOR_UND, MODE_UND),
             ExceptionKind::SoftwareInterrupt => (VECTOR_SWI, MODE_SVC),
+            ExceptionKind::Interrupt(_) => (VECTOR_IRQ, MODE_IRQ),
         };
 
         match mode {
             MODE_UND => self.spsr_und = self.cpsr,
             MODE_SVC => self.spsr_svc = self.cpsr,
+            MODE_IRQ => self.spsr_irq = self.cpsr,
             _ => {}
         }
 
         self.regs[LR_INDEX] = pc.wrapping_add(4);
         self.regs[PC_INDEX] = vector;
-        self.cpsr = (self.cpsr & !MODE_MASK) | mode;
+        self.cpsr = ((self.cpsr & !MODE_MASK) | mode) | FLAG_I;
         self.last_exception = Some(CpuException {
             kind,
             vector,

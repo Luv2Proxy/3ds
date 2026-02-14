@@ -1,14 +1,16 @@
 use super::cpu::{Arm11Cpu, CpuException, CpuRunState, ExceptionKind};
+use super::dma::{DmaEngine, DmaTransfer, DmaTransferKind};
 use super::dsp::Dsp;
 use super::error::{EmulatorError, Result};
 use super::fs::TitlePackage;
 use super::fs::VirtualFileSystem;
+use super::irq::{IrqController, IrqLine};
 use super::kernel::{Kernel, ServiceEvent};
 use super::loader::load_process_with_fs_from_rom;
 use super::memory::Memory;
 use super::pica::PicaGpu;
 use super::rom::RomImage;
-use super::scheduler::Scheduler;
+use super::scheduler::{ScheduledDeviceEvent, Scheduler};
 use super::timing::{TimingModel, TimingSnapshot};
 
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +33,8 @@ pub struct Emulator3ds {
     gpu: PicaGpu,
     dsp: Dsp,
     scheduler: Scheduler,
+    irq: IrqController,
+    dma: DmaEngine,
     kernel: Kernel,
     timing: TimingModel,
     rom_loaded: bool,
@@ -68,6 +72,8 @@ impl Emulator3ds {
             gpu: PicaGpu::new(),
             dsp: Dsp::new(),
             scheduler: Scheduler::new(),
+            irq: IrqController::new(),
+            dma: DmaEngine::new(),
             kernel: Kernel::new(),
             timing: TimingModel::new(),
             rom_loaded: false,
@@ -79,6 +85,8 @@ impl Emulator3ds {
     pub fn reset(&mut self) {
         self.memory.clear_writable();
         self.scheduler.reset();
+        self.irq.reset();
+        self.dma.reset();
         self.timing.reset();
         self.kernel.reset_runtime();
         self.cpu.reset(0);
@@ -93,8 +101,11 @@ impl Emulator3ds {
         self.vfs = vfs;
         self.cpu.reset(metadata.entrypoint);
         self.scheduler.reset();
+        self.irq.reset();
+        self.dma.reset();
         self.timing.reset();
         self.rom_loaded = true;
+        self.schedule_boot_events();
         Ok(())
     }
 
@@ -114,6 +125,60 @@ impl Emulator3ds {
         self.gpu.enqueue_gsp_fifo_words(words);
     }
 
+    pub fn queue_dma_memcpy(&mut self, channel: u8, source: u32, destination: u32, words: u32) {
+        let latency = self.dma.queue_transfer(DmaTransfer {
+            channel,
+            source,
+            destination,
+            words,
+            kind: DmaTransferKind::MemoryToMemory,
+        });
+        self.scheduler
+            .schedule_in(latency, ScheduledDeviceEvent::DmaCompletion { channel });
+    }
+
+    pub fn queue_dma_gpu_feed(&mut self, channel: u8, source: u32, words: u32) {
+        let latency = self.dma.queue_transfer(DmaTransfer {
+            channel,
+            source,
+            destination: 0,
+            words,
+            kind: DmaTransferKind::GpuQueueFeed,
+        });
+        self.scheduler
+            .schedule_in(latency, ScheduledDeviceEvent::DmaCompletion { channel });
+    }
+
+    fn schedule_boot_events(&mut self) {
+        self.scheduler
+            .schedule_in(16, ScheduledDeviceEvent::TimerExpiry);
+        self.scheduler
+            .schedule_in(4_000_000, ScheduledDeviceEvent::VBlank);
+    }
+
+    fn handle_scheduled_event(&mut self, event: ScheduledDeviceEvent) {
+        match event {
+            ScheduledDeviceEvent::TimerExpiry => {
+                self.irq.raise(IrqLine::Timer0);
+                self.scheduler
+                    .schedule_in(16, ScheduledDeviceEvent::TimerExpiry);
+            }
+            ScheduledDeviceEvent::VBlank => {
+                self.irq.raise(IrqLine::VBlank);
+                self.scheduler
+                    .schedule_in(4_000_000, ScheduledDeviceEvent::VBlank);
+            }
+            ScheduledDeviceEvent::DmaCompletion { channel } => {
+                if self
+                    .dma
+                    .complete_transfer(channel, &mut self.memory, &mut self.gpu)
+                {
+                    self.irq.raise(IrqLine::Dma0);
+                }
+            }
+        }
+    }
+
     pub fn run_cycles(&mut self, budget: u32) -> Result<u32> {
         if !self.rom_loaded {
             return Err(EmulatorError::RomNotLoaded);
@@ -123,11 +188,23 @@ impl Emulator3ds {
         let mut executed = 0;
 
         for _ in 0..capped_budget {
+            if self.cpu.interrupts_enabled()
+                && let Some(line) = self.irq.next_pending()
+            {
+                self.irq.clear(line);
+                self.cpu.enter_irq(line);
+            }
+
             let consumed = self.cpu.step(&mut self.memory)?;
             self.scheduler.tick(consumed);
             self.kernel.tick(consumed);
             self.timing.tick(consumed);
             self.kernel.pump_ipc_events(1);
+
+            for event in self.scheduler.drain_due_events() {
+                self.handle_scheduled_event(event);
+            }
+
             for fifo_words in self.kernel.drain_gpu_handoff() {
                 self.gpu.enqueue_gsp_fifo_words(&fifo_words);
             }
@@ -285,6 +362,61 @@ mod tests {
             .unwrap_or_else(|e| panic!("run works: {e}"));
         let state = emu.state();
         assert_eq!(state.pc, 0x0010_0004);
+    }
+
+    #[test]
+    fn timer_event_triggers_irq_entry() {
+        let mut emu = Emulator3ds::new();
+        let mut rom = valid_rom();
+        write_insn(&mut rom, 0xA00, 0xE1A0_0000); // NOP
+        write_insn(&mut rom, 0xA18, 0xE320_F003); // HALT in IRQ vector
+        emu.load_rom(&rom)
+            .unwrap_or_else(|e| panic!("load works: {e}"));
+
+        emu.scheduler
+            .schedule_in(1, ScheduledDeviceEvent::TimerExpiry);
+
+        emu.run_cycles(8)
+            .unwrap_or_else(|e| panic!("run works: {e}"));
+
+        let state = emu.state();
+        let exception = state
+            .last_exception
+            .unwrap_or_else(|| panic!("expected IRQ exception"));
+        assert!(matches!(
+            exception.kind,
+            ExceptionKind::Interrupt(IrqLine::Timer0)
+        ));
+        assert_eq!(exception.vector, 0x0010_0018);
+        assert_eq!(state.pc, 0x0010_001C);
+    }
+
+    #[test]
+    fn dma_completion_signals_irq_and_copies_memory() {
+        let mut emu = Emulator3ds::new();
+        let mut rom = valid_rom();
+        write_insn(&mut rom, 0xA00, 0xE1A0_0000); // NOP
+        write_insn(&mut rom, 0xA18, 0xE320_F003); // HALT in IRQ vector
+        emu.load_rom(&rom)
+            .unwrap_or_else(|e| panic!("load works: {e}"));
+
+        emu.write_phys_u32(0x0000_0080, 0x1122_3344);
+        emu.write_phys_u32(0x0000_0084, 0x5566_7788);
+        emu.queue_dma_memcpy(0, 0x0000_0080, 0x0000_0100, 2);
+
+        emu.run_cycles(8)
+            .unwrap_or_else(|e| panic!("run works: {e}"));
+
+        assert_eq!(emu.read_phys_u32(0x0000_0100), 0x1122_3344);
+        assert_eq!(emu.read_phys_u32(0x0000_0104), 0x5566_7788);
+        let exception = emu
+            .state()
+            .last_exception
+            .unwrap_or_else(|| panic!("expected DMA IRQ"));
+        assert!(matches!(
+            exception.kind,
+            ExceptionKind::Interrupt(IrqLine::Dma0)
+        ));
     }
 
     #[test]
