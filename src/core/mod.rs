@@ -6,6 +6,7 @@ pub mod fs;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
+pub mod mmu;
 pub mod pica;
 pub mod rom;
 pub mod scheduler;
