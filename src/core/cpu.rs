@@ -1,3 +1,4 @@
+use super::error::EmulatorError;
 use super::error::MemoryAccessKind;
 use super::error::Result;
 use super::irq::IrqLine;
@@ -7,23 +8,33 @@ use super::mmu::Mmu;
 const REG_COUNT: usize = 16;
 const PC_INDEX: usize = 15;
 const LR_INDEX: usize = 14;
+const SP_INDEX: usize = 13;
 
 const FLAG_N: u32 = 1 << 31;
 const FLAG_Z: u32 = 1 << 30;
 const FLAG_C: u32 = 1 << 29;
 const FLAG_V: u32 = 1 << 28;
 const FLAG_I: u32 = 1 << 7;
+const FLAG_T: u32 = 1 << 5;
 
 const MODE_MASK: u32 = 0x1F;
 const MODE_USR: u32 = 0b1_0000;
-const MODE_UND: u32 = 0b1_1011;
-const MODE_SVC: u32 = 0b1_0011;
 const MODE_IRQ: u32 = 0b1_0010;
+const MODE_SVC: u32 = 0b1_0011;
+const MODE_ABT: u32 = 0b1_0111;
+const MODE_UND: u32 = 0b1_1011;
 
 const VECTOR_BASE: u32 = 0x0010_0000;
 const VECTOR_UND: u32 = VECTOR_BASE + 0x0000_0004;
 const VECTOR_SWI: u32 = VECTOR_BASE + 0x0000_0008;
+const VECTOR_PABT: u32 = VECTOR_BASE + 0x0000_000C;
+const VECTOR_DABT: u32 = VECTOR_BASE + 0x0000_0010;
 const VECTOR_IRQ: u32 = VECTOR_BASE + 0x0000_0018;
+
+const CP15_DFSR: usize = 5;
+const CP15_IFSR: usize = 6;
+const CP15_DFAR: usize = 7;
+const CP15_IFAR: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuRunState {
@@ -32,9 +43,19 @@ pub enum CpuRunState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    Translation,
+    Domain,
+    Permission,
+    Alignment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExceptionKind {
     UndefinedInstruction,
     SoftwareInterrupt,
+    PrefetchAbort(FaultKind),
+    DataAbort(FaultKind),
     Interrupt(IrqLine),
 }
 
@@ -46,6 +67,13 @@ pub struct CpuException {
     pub fault_opcode: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstructionTraceEntry {
+    pub pc: u32,
+    pub opcode: u32,
+    pub thumb: bool,
+}
+
 #[derive(Clone)]
 pub struct Arm11Cpu {
     regs: [u32; REG_COUNT],
@@ -53,10 +81,24 @@ pub struct Arm11Cpu {
     spsr_und: u32,
     spsr_svc: u32,
     spsr_irq: u32,
+    spsr_abt: u32,
+    bank_usr_sp: u32,
+    bank_usr_lr: u32,
+    bank_svc_sp: u32,
+    bank_svc_lr: u32,
+    bank_irq_sp: u32,
+    bank_irq_lr: u32,
+    bank_und_sp: u32,
+    bank_und_lr: u32,
+    bank_abt_sp: u32,
+    bank_abt_lr: u32,
     state: CpuRunState,
     last_exception: Option<CpuException>,
     cp15_regs: [u32; 16],
     mmu: Mmu,
+    trace_enabled: bool,
+    trace_limit: usize,
+    trace_log: Vec<InstructionTraceEntry>,
 }
 
 impl Default for Arm11Cpu {
@@ -73,10 +115,24 @@ impl Arm11Cpu {
             spsr_und: MODE_USR,
             spsr_svc: MODE_USR,
             spsr_irq: MODE_USR,
+            spsr_abt: MODE_USR,
+            bank_usr_sp: 0,
+            bank_usr_lr: 0,
+            bank_svc_sp: 0,
+            bank_svc_lr: 0,
+            bank_irq_sp: 0,
+            bank_irq_lr: 0,
+            bank_und_sp: 0,
+            bank_und_lr: 0,
+            bank_abt_sp: 0,
+            bank_abt_lr: 0,
             state: CpuRunState::Running,
             last_exception: None,
             cp15_regs: [0; 16],
             mmu: Mmu::new(),
+            trace_enabled: false,
+            trace_limit: 0,
+            trace_log: Vec::new(),
         }
     }
 
@@ -87,10 +143,32 @@ impl Arm11Cpu {
         self.spsr_und = MODE_USR;
         self.spsr_svc = MODE_USR;
         self.spsr_irq = MODE_USR;
+        self.spsr_abt = MODE_USR;
+        self.bank_usr_sp = 0;
+        self.bank_usr_lr = 0;
+        self.bank_svc_sp = 0;
+        self.bank_svc_lr = 0;
+        self.bank_irq_sp = 0;
+        self.bank_irq_lr = 0;
+        self.bank_und_sp = 0;
+        self.bank_und_lr = 0;
+        self.bank_abt_sp = 0;
+        self.bank_abt_lr = 0;
         self.state = CpuRunState::Running;
         self.last_exception = None;
         self.cp15_regs = [0; 16];
         self.mmu.reset();
+        self.trace_log.clear();
+    }
+
+    pub fn enable_instruction_trace(&mut self, limit: usize) {
+        self.trace_enabled = limit > 0;
+        self.trace_limit = limit;
+        self.trace_log.clear();
+    }
+
+    pub fn instruction_trace(&self) -> &[InstructionTraceEntry] {
+        &self.trace_log
     }
 
     pub fn run_state(&self) -> CpuRunState {
@@ -122,7 +200,7 @@ impl Arm11Cpu {
             self.state = CpuRunState::Running;
         }
         let pc = self.pc();
-        self.take_exception(ExceptionKind::Interrupt(line), pc, line as u32);
+        self.take_exception(ExceptionKind::Interrupt(line), pc, line as u32, true);
     }
 
     pub fn step(&mut self, memory: &mut Memory) -> Result<u32> {
@@ -130,8 +208,24 @@ impl Arm11Cpu {
             return Ok(1);
         }
 
+        if self.is_thumb() {
+            self.step_thumb(memory)
+        } else {
+            self.step_arm(memory)
+        }
+    }
+
+    fn step_arm(&mut self, memory: &mut Memory) -> Result<u32> {
         let pc = self.pc();
-        let opcode = self.fetch_instruction(memory, pc)?;
+        let opcode = match self.fetch_instruction(memory, pc) {
+            Ok(op) => op,
+            Err(kind) => {
+                self.take_prefetch_abort(kind, pc, 0);
+                return Ok(3);
+            }
+        };
+
+        self.record_trace(pc, opcode, false);
         self.regs[PC_INDEX] = pc.wrapping_add(4);
 
         if !self.condition_passed(opcode >> 28) {
@@ -144,7 +238,7 @@ impl Arm11Cpu {
         }
 
         if (opcode >> 24) & 0xF == 0xF {
-            self.take_exception(ExceptionKind::SoftwareInterrupt, pc, opcode);
+            self.take_exception(ExceptionKind::SoftwareInterrupt, pc, opcode, true);
             return Ok(3);
         }
 
@@ -162,8 +256,13 @@ impl Arm11Cpu {
         }
 
         if (opcode >> 26) & 0x3 == 0b01 {
-            self.exec_single_data_transfer(opcode, memory)?;
-            return Ok(3);
+            return match self.exec_single_data_transfer(opcode, memory) {
+                Ok(_) => Ok(3),
+                Err(kind) => {
+                    self.take_data_abort(kind, pc, opcode);
+                    Ok(3)
+                }
+            };
         }
 
         if (opcode >> 26) & 0x3 == 0b00 {
@@ -178,25 +277,118 @@ impl Arm11Cpu {
             }
         }
 
-        self.take_exception(ExceptionKind::UndefinedInstruction, pc, opcode);
+        self.take_exception(ExceptionKind::UndefinedInstruction, pc, opcode, true);
         Ok(3)
     }
 
-    fn fetch_instruction(&mut self, memory: &Memory, va: u32) -> Result<u32> {
-        let pa = self.translate_va(memory, va, MemoryAccessKind::Execute)?;
-        memory.read_u32_checked(pa)
+    fn step_thumb(&mut self, memory: &mut Memory) -> Result<u32> {
+        let pc = self.pc();
+        let opcode = match self.fetch_thumb_instruction(memory, pc) {
+            Ok(op) => op,
+            Err(kind) => {
+                self.take_prefetch_abort(kind, pc, 0);
+                return Ok(3);
+            }
+        };
+
+        self.record_trace(pc, u32::from(opcode), true);
+        self.regs[PC_INDEX] = pc.wrapping_add(2);
+
+        if self.exec_thumb_shift_imm(opcode)
+            || self.exec_thumb_add_sub(opcode)
+            || self.exec_thumb_mov_cmp_add_sub_imm(opcode)
+            || self.exec_thumb_hi_reg_bx(opcode)
+            || self.exec_thumb_cond_branch(opcode)
+            || self.exec_thumb_uncond_branch(opcode)
+        {
+            return Ok(1);
+        }
+
+        if self.exec_thumb_ldr_literal(opcode, memory)?
+            || self.exec_thumb_load_store_imm(opcode, memory)?
+        {
+            return Ok(1);
+        }
+
+        self.take_exception(
+            ExceptionKind::UndefinedInstruction,
+            pc,
+            u32::from(opcode),
+            true,
+        );
+        Ok(3)
     }
 
-    fn translate_va(&mut self, memory: &Memory, va: u32, access: MemoryAccessKind) -> Result<u32> {
-        self.mmu.translate(memory, va, access, self.is_privileged())
+    fn record_trace(&mut self, pc: u32, opcode: u32, thumb: bool) {
+        if !self.trace_enabled {
+            return;
+        }
+        self.trace_log
+            .push(InstructionTraceEntry { pc, opcode, thumb });
+        if self.trace_log.len() > self.trace_limit {
+            let excess = self.trace_log.len() - self.trace_limit;
+            self.trace_log.drain(0..excess);
+        }
+    }
+
+    fn fetch_instruction(
+        &mut self,
+        memory: &Memory,
+        va: u32,
+    ) -> std::result::Result<u32, FaultKind> {
+        if va & 3 != 0 {
+            return Err(FaultKind::Alignment);
+        }
+        let pa = self.translate_va(memory, va, MemoryAccessKind::Execute)?;
+        memory
+            .read_u32_checked(pa)
+            .map_err(|_| FaultKind::Translation)
+    }
+
+    fn fetch_thumb_instruction(
+        &mut self,
+        memory: &Memory,
+        va: u32,
+    ) -> std::result::Result<u16, FaultKind> {
+        if va & 1 != 0 {
+            return Err(FaultKind::Alignment);
+        }
+        let pa = self.translate_va(memory, va, MemoryAccessKind::Execute)?;
+        let lo = memory.read_u8(pa);
+        let hi = memory.read_u8(pa.wrapping_add(1));
+        Ok(u16::from_le_bytes([lo, hi]))
+    }
+
+    fn translate_va(
+        &mut self,
+        memory: &Memory,
+        va: u32,
+        access: MemoryAccessKind,
+    ) -> std::result::Result<u32, FaultKind> {
+        self.mmu
+            .translate(memory, va, access.clone(), self.is_privileged())
+            .map_err(Self::fault_kind_from_error)
+    }
+
+    fn fault_kind_from_error(err: EmulatorError) -> FaultKind {
+        match err {
+            EmulatorError::MmuTranslationFault { .. } => FaultKind::Translation,
+            EmulatorError::MmuDomainFault { .. } => FaultKind::Domain,
+            EmulatorError::MmuPermissionFault { .. } => FaultKind::Permission,
+            EmulatorError::AlignmentFault { .. } => FaultKind::Alignment,
+            _ => FaultKind::Translation,
+        }
     }
 
     fn is_privileged(&self) -> bool {
         self.mode() != MODE_USR
     }
 
+    fn is_thumb(&self) -> bool {
+        self.cpsr & FLAG_T != 0
+    }
+
     fn exec_system(&mut self, opcode: u32) -> bool {
-        // MRS CPSR/SPSR
         if opcode & 0x0FBF_0FFF == 0x010F_0000 {
             let rd = ((opcode >> 12) & 0xF) as usize;
             let spsr = ((opcode >> 22) & 1) == 1;
@@ -208,12 +400,11 @@ impl Arm11Cpu {
             return true;
         }
 
-        // MSR CPSR_f, Rm (subset)
         if opcode & 0x0FB0_FFF0 == 0x0120_F000 {
             let rm = (opcode & 0xF) as usize;
             self.cpsr = (self.cpsr & !0xF000_0000)
                 | (self.regs[rm] & 0xF000_0000)
-                | (self.cpsr & MODE_MASK);
+                | (self.cpsr & (MODE_MASK | FLAG_T));
             return true;
         }
 
@@ -221,7 +412,6 @@ impl Arm11Cpu {
     }
 
     fn exec_coprocessor(&mut self, opcode: u32, _memory: &mut Memory) -> bool {
-        // Very small MRC/MCR CP15 subset model.
         if (opcode & 0x0F00_0010) == 0x0E00_0010 {
             let cp_num = (opcode >> 8) & 0xF;
             let rd = ((opcode >> 12) & 0xF) as usize;
@@ -255,9 +445,7 @@ impl Arm11Cpu {
                             self.cp15_regs[3] = value;
                             self.mmu.write_dacr(value);
                         }
-                        (8, 7, 0) | (8, 5, 0) | (8, 6, 0) => {
-                            self.mmu.invalidate_tlb();
-                        }
+                        (8, 7, 0) | (8, 5, 0) | (8, 6, 0) => self.mmu.invalidate_tlb(),
                         _ => {}
                     }
                 }
@@ -303,7 +491,11 @@ impl Arm11Cpu {
         self.regs[PC_INDEX] = target;
     }
 
-    fn exec_single_data_transfer(&mut self, opcode: u32, memory: &mut Memory) -> Result<()> {
+    fn exec_single_data_transfer(
+        &mut self,
+        opcode: u32,
+        memory: &mut Memory,
+    ) -> std::result::Result<(), FaultKind> {
         let immediate_offset = ((opcode >> 25) & 1) == 0;
         let pre_index = ((opcode >> 24) & 1) == 1;
         let add = ((opcode >> 23) & 1) == 1;
@@ -325,12 +517,20 @@ impl Arm11Cpu {
         };
 
         let address = if pre_index { effective } else { base };
+        if address & 3 != 0 {
+            return Err(FaultKind::Alignment);
+        }
+
         if load {
             let pa = self.translate_va(memory, address, MemoryAccessKind::Read)?;
-            self.regs[rd] = memory.read_u32_checked(pa)?;
+            self.regs[rd] = memory
+                .read_u32_checked(pa)
+                .map_err(|_| FaultKind::Translation)?;
         } else {
             let pa = self.translate_va(memory, address, MemoryAccessKind::Write)?;
-            memory.write_u32_checked(pa, self.regs[rd])?;
+            memory
+                .write_u32_checked(pa, self.regs[rd])
+                .map_err(|_| FaultKind::Translation)?;
         }
 
         if write_back || !pre_index {
@@ -368,8 +568,8 @@ impl Arm11Cpu {
         let mut write_result = None;
 
         match op {
-            0x0 => write_result = Some(lhs & operand2), // AND
-            0x1 => write_result = Some(lhs ^ operand2), // EOR
+            0x0 => write_result = Some(lhs & operand2),
+            0x1 => write_result = Some(lhs ^ operand2),
             0x2 => {
                 let (res, borrow) = lhs.overflowing_sub(operand2);
                 write_result = Some(res);
@@ -415,15 +615,13 @@ impl Arm11Cpu {
                 }
             }
             0x8 => {
-                let res = lhs & operand2;
                 if set_flags {
-                    self.update_nzcv_logical(res, shifter_carry);
+                    self.update_nzcv_logical(lhs & operand2, shifter_carry);
                 }
             }
             0x9 => {
-                let res = lhs ^ operand2;
                 if set_flags {
-                    self.update_nzcv_logical(res, shifter_carry);
+                    self.update_nzcv_logical(lhs ^ operand2, shifter_carry);
                 }
             }
             0xA => {
@@ -463,11 +661,252 @@ impl Arm11Cpu {
     fn exec_bx(&mut self, opcode: u32) -> bool {
         if opcode & 0x0FFF_FFF0 == 0x012F_FF10 {
             let rm = (opcode & 0xF) as usize;
-            self.regs[PC_INDEX] = self.regs[rm] & !1;
+            let target = self.regs[rm];
+            self.set_thumb_state((target & 1) != 0);
+            self.regs[PC_INDEX] = target & !1;
             true
         } else {
             false
         }
+    }
+
+    fn exec_thumb_shift_imm(&mut self, opcode: u16) -> bool {
+        if (opcode >> 13) != 0 {
+            return false;
+        }
+        let op = (opcode >> 11) & 0x3;
+        let offset = u32::from((opcode >> 6) & 0x1F);
+        let rs = usize::from((opcode >> 3) & 0x7);
+        let rd = usize::from(opcode & 0x7);
+        let value = self.regs[rs];
+        let (result, carry) = match op {
+            0b00 => {
+                if offset == 0 {
+                    (value, self.cpsr & FLAG_C != 0)
+                } else {
+                    (value << offset, ((value >> (32 - offset)) & 1) != 0)
+                }
+            }
+            0b01 => {
+                let s = if offset == 0 { 32 } else { offset };
+                if s == 32 {
+                    (0, (value >> 31) != 0)
+                } else {
+                    (value >> s, ((value >> (s - 1)) & 1) != 0)
+                }
+            }
+            0b10 => {
+                let s = if offset == 0 { 32 } else { offset };
+                let result = if s == 32 {
+                    if (value >> 31) != 0 { u32::MAX } else { 0 }
+                } else {
+                    ((value as i32) >> s) as u32
+                };
+                (result, ((value >> (s.saturating_sub(1).min(31))) & 1) != 0)
+            }
+            _ => return false,
+        };
+
+        self.regs[rd] = result;
+        self.update_nzcv_logical(result, carry);
+        true
+    }
+
+    fn exec_thumb_add_sub(&mut self, opcode: u16) -> bool {
+        if (opcode & 0xF800) != 0x1800 {
+            return false;
+        }
+        let immediate = ((opcode >> 10) & 1) != 0;
+        let sub = ((opcode >> 9) & 1) != 0;
+        let rn_or_imm = u32::from((opcode >> 6) & 0x7);
+        let rs = usize::from((opcode >> 3) & 0x7);
+        let rd = usize::from(opcode & 0x7);
+        let lhs = self.regs[rs];
+        let rhs = if immediate {
+            rn_or_imm
+        } else {
+            self.regs[rn_or_imm as usize]
+        };
+
+        if sub {
+            let (res, borrow) = lhs.overflowing_sub(rhs);
+            let overflow = ((lhs ^ rhs) & (lhs ^ res) & FLAG_N) != 0;
+            self.regs[rd] = res;
+            self.update_nzcv_arithmetic(res, !borrow, overflow);
+        } else {
+            let (res, carry) = lhs.overflowing_add(rhs);
+            let overflow = ((!(lhs ^ rhs)) & (lhs ^ res) & FLAG_N) != 0;
+            self.regs[rd] = res;
+            self.update_nzcv_arithmetic(res, carry, overflow);
+        }
+        true
+    }
+
+    fn exec_thumb_mov_cmp_add_sub_imm(&mut self, opcode: u16) -> bool {
+        if (opcode & 0xE000) != 0x2000 {
+            return false;
+        }
+        let op = (opcode >> 11) & 0x3;
+        let rd = usize::from((opcode >> 8) & 0x7);
+        let imm = u32::from(opcode & 0xFF);
+
+        match op {
+            0b00 => {
+                self.regs[rd] = imm;
+                self.update_nzcv_logical(imm, self.cpsr & FLAG_C != 0);
+            }
+            0b01 => {
+                let lhs = self.regs[rd];
+                let (res, borrow) = lhs.overflowing_sub(imm);
+                let overflow = ((lhs ^ imm) & (lhs ^ res) & FLAG_N) != 0;
+                self.update_nzcv_arithmetic(res, !borrow, overflow);
+            }
+            0b10 => {
+                let lhs = self.regs[rd];
+                let (res, carry) = lhs.overflowing_add(imm);
+                let overflow = ((!(lhs ^ imm)) & (lhs ^ res) & FLAG_N) != 0;
+                self.regs[rd] = res;
+                self.update_nzcv_arithmetic(res, carry, overflow);
+            }
+            0b11 => {
+                let lhs = self.regs[rd];
+                let (res, borrow) = lhs.overflowing_sub(imm);
+                let overflow = ((lhs ^ imm) & (lhs ^ res) & FLAG_N) != 0;
+                self.regs[rd] = res;
+                self.update_nzcv_arithmetic(res, !borrow, overflow);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn exec_thumb_hi_reg_bx(&mut self, opcode: u16) -> bool {
+        if (opcode & 0xFC00) != 0x4400 {
+            return false;
+        }
+        let op = (opcode >> 8) & 0x3;
+        let h1 = ((opcode >> 7) & 1) as usize;
+        let h2 = ((opcode >> 6) & 1) as usize;
+        let rs = usize::from((opcode >> 3) & 0x7) | (h2 << 3);
+        let rd = usize::from(opcode & 0x7) | (h1 << 3);
+
+        match op {
+            0b00 => self.regs[rd] = self.regs[rd].wrapping_add(self.regs[rs]),
+            0b01 => {
+                let lhs = self.regs[rd];
+                let rhs = self.regs[rs];
+                let (res, borrow) = lhs.overflowing_sub(rhs);
+                let overflow = ((lhs ^ rhs) & (lhs ^ res) & FLAG_N) != 0;
+                self.update_nzcv_arithmetic(res, !borrow, overflow);
+            }
+            0b10 => self.regs[rd] = self.regs[rs],
+            0b11 => {
+                let target = self.regs[rs];
+                self.set_thumb_state((target & 1) != 0);
+                self.regs[PC_INDEX] = target & !1;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn exec_thumb_ldr_literal(&mut self, opcode: u16, memory: &mut Memory) -> Result<bool> {
+        if (opcode & 0xF800) != 0x4800 {
+            return Ok(false);
+        }
+        let rd = usize::from((opcode >> 8) & 0x7);
+        let imm = u32::from(opcode & 0xFF) << 2;
+        let address = (self.regs[PC_INDEX] & !3).wrapping_add(imm);
+        if address & 3 != 0 {
+            return Err(EmulatorError::AlignmentFault {
+                va: address,
+                access: MemoryAccessKind::Read,
+            });
+        }
+        let pa = self
+            .translate_va(memory, address, MemoryAccessKind::Read)
+            .map_err(|_| EmulatorError::MmuTranslationFault {
+                va: address,
+                access: MemoryAccessKind::Read,
+            })?;
+        self.regs[rd] = memory.read_u32_checked(pa)?;
+        Ok(true)
+    }
+
+    fn exec_thumb_load_store_imm(&mut self, opcode: u16, memory: &mut Memory) -> Result<bool> {
+        if (opcode & 0xE000) != 0x6000 {
+            return Ok(false);
+        }
+        let load = ((opcode >> 11) & 1) != 0;
+        let imm5 = u32::from((opcode >> 6) & 0x1F) << 2;
+        let rb = usize::from((opcode >> 3) & 0x7);
+        let rd = usize::from(opcode & 0x7);
+        let address = self.regs[rb].wrapping_add(imm5);
+
+        if address & 3 != 0 {
+            self.take_data_abort(FaultKind::Alignment, self.pc(), u32::from(opcode));
+            return Ok(true);
+        }
+
+        if load {
+            let pa = match self.translate_va(memory, address, MemoryAccessKind::Read) {
+                Ok(pa) => pa,
+                Err(kind) => {
+                    self.take_data_abort(kind, self.pc(), u32::from(opcode));
+                    return Ok(true);
+                }
+            };
+            self.regs[rd] = match memory.read_u32_checked(pa) {
+                Ok(v) => v,
+                Err(_) => {
+                    self.take_data_abort(FaultKind::Translation, self.pc(), u32::from(opcode));
+                    return Ok(true);
+                }
+            };
+        } else {
+            let pa = match self.translate_va(memory, address, MemoryAccessKind::Write) {
+                Ok(pa) => pa,
+                Err(kind) => {
+                    self.take_data_abort(kind, self.pc(), u32::from(opcode));
+                    return Ok(true);
+                }
+            };
+            if memory.write_u32_checked(pa, self.regs[rd]).is_err() {
+                self.take_data_abort(FaultKind::Translation, self.pc(), u32::from(opcode));
+                return Ok(true);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn exec_thumb_cond_branch(&mut self, opcode: u16) -> bool {
+        if (opcode & 0xF000) != 0xD000 || (opcode & 0x0F00) == 0x0F00 {
+            return false;
+        }
+        let cond = u32::from((opcode >> 8) & 0xF);
+        if !self.condition_passed(cond) {
+            return true;
+        }
+        let offset = i32::from((opcode & 0xFF) as i8) << 1;
+        self.regs[PC_INDEX] = self.regs[PC_INDEX].wrapping_add(offset as u32);
+        true
+    }
+
+    fn exec_thumb_uncond_branch(&mut self, opcode: u16) -> bool {
+        if (opcode & 0xF800) != 0xE000 {
+            return false;
+        }
+        let mut offset = i32::from((opcode & 0x07FF) as i16) << 1;
+        if (offset & 0x0800) != 0 {
+            offset |= !0x0FFF;
+        }
+        self.regs[PC_INDEX] = self.regs[PC_INDEX].wrapping_add(offset as u32);
+        true
+    }
+
+    fn set_thumb_state(&mut self, thumb: bool) {
+        self.set_flag(FLAG_T, thumb);
     }
 
     fn shift_value(&self, value: u32, shift_imm: u32, shift_type: u32) -> (u32, bool) {
@@ -536,37 +975,112 @@ impl Arm11Cpu {
             MODE_UND => Some(self.spsr_und),
             MODE_SVC => Some(self.spsr_svc),
             MODE_IRQ => Some(self.spsr_irq),
+            MODE_ABT => Some(self.spsr_abt),
             _ => None,
         }
     }
 
+    fn set_current_spsr(&mut self, value: u32) {
+        match self.mode() {
+            MODE_UND => self.spsr_und = value,
+            MODE_SVC => self.spsr_svc = value,
+            MODE_IRQ => self.spsr_irq = value,
+            MODE_ABT => self.spsr_abt = value,
+            _ => {}
+        }
+    }
+
+    fn banked_sp_lr_mut(&mut self, mode: u32) -> (&mut u32, &mut u32) {
+        match mode {
+            MODE_USR => (&mut self.bank_usr_sp, &mut self.bank_usr_lr),
+            MODE_SVC => (&mut self.bank_svc_sp, &mut self.bank_svc_lr),
+            MODE_IRQ => (&mut self.bank_irq_sp, &mut self.bank_irq_lr),
+            MODE_UND => (&mut self.bank_und_sp, &mut self.bank_und_lr),
+            MODE_ABT => (&mut self.bank_abt_sp, &mut self.bank_abt_lr),
+            _ => (&mut self.bank_usr_sp, &mut self.bank_usr_lr),
+        }
+    }
+
+    fn switch_mode(&mut self, new_mode: u32) {
+        let old_mode = self.mode();
+        if old_mode == new_mode {
+            return;
+        }
+
+        let old_sp = self.regs[SP_INDEX];
+        let old_lr = self.regs[LR_INDEX];
+        {
+            let (sp, lr) = self.banked_sp_lr_mut(old_mode);
+            *sp = old_sp;
+            *lr = old_lr;
+        }
+
+        let (new_sp, new_lr) = {
+            let (sp, lr) = self.banked_sp_lr_mut(new_mode);
+            (*sp, *lr)
+        };
+        self.regs[SP_INDEX] = new_sp;
+        self.regs[LR_INDEX] = new_lr;
+        self.cpsr = (self.cpsr & !MODE_MASK) | new_mode;
+    }
+
     fn restore_cpsr_from_spsr(&mut self) {
         if let Some(saved) = self.current_spsr() {
+            self.switch_mode(saved & MODE_MASK);
             self.cpsr = saved;
         }
     }
 
-    fn take_exception(&mut self, kind: ExceptionKind, pc: u32, fault_opcode: u32) {
+    fn take_prefetch_abort(&mut self, fault: FaultKind, pc: u32, opcode: u32) {
+        self.cp15_regs[CP15_IFAR] = pc;
+        self.cp15_regs[CP15_IFSR] = self.encode_fault_status(fault);
+        self.take_exception(ExceptionKind::PrefetchAbort(fault), pc, opcode, true);
+    }
+
+    fn take_data_abort(&mut self, fault: FaultKind, pc: u32, opcode: u32) {
+        self.cp15_regs[CP15_DFAR] = self.regs[PC_INDEX];
+        self.cp15_regs[CP15_DFSR] = self.encode_fault_status(fault);
+        self.take_exception(ExceptionKind::DataAbort(fault), pc, opcode, false);
+    }
+
+    fn encode_fault_status(&self, fault: FaultKind) -> u32 {
+        match fault {
+            FaultKind::Translation => 0b00101,
+            FaultKind::Domain => 0b01001,
+            FaultKind::Permission => 0b01101,
+            FaultKind::Alignment => 0b00001,
+        }
+    }
+
+    fn take_exception(&mut self, kind: ExceptionKind, pc: u32, fault_opcode: u32, lr_plus_4: bool) {
         let (vector, mode) = match kind {
             ExceptionKind::UndefinedInstruction => (VECTOR_UND, MODE_UND),
             ExceptionKind::SoftwareInterrupt => (VECTOR_SWI, MODE_SVC),
+            ExceptionKind::PrefetchAbort(_) => (VECTOR_PABT, MODE_ABT),
+            ExceptionKind::DataAbort(_) => (VECTOR_DABT, MODE_ABT),
             ExceptionKind::Interrupt(_) => (VECTOR_IRQ, MODE_IRQ),
         };
 
-        match mode {
-            MODE_UND => self.spsr_und = self.cpsr,
-            MODE_SVC => self.spsr_svc = self.cpsr,
-            MODE_IRQ => self.spsr_irq = self.cpsr,
-            _ => {}
-        }
+        let return_addr = if matches!(kind, ExceptionKind::PrefetchAbort(_)) {
+            pc.wrapping_add(4)
+        } else if matches!(kind, ExceptionKind::DataAbort(_)) {
+            pc.wrapping_add(8)
+        } else if lr_plus_4 {
+            pc.wrapping_add(4)
+        } else {
+            pc
+        };
 
-        self.regs[LR_INDEX] = pc.wrapping_add(4);
+        self.set_current_spsr(self.cpsr);
+        self.switch_mode(mode);
+        self.regs[LR_INDEX] = return_addr;
         self.regs[PC_INDEX] = vector;
-        self.cpsr = ((self.cpsr & !MODE_MASK) | mode) | FLAG_I;
+        self.cpsr |= FLAG_I;
+        self.cpsr &= !FLAG_T;
         self.last_exception = Some(CpuException {
             kind,
             vector,
-            return_address: pc.wrapping_add(4),
+            return_address: return_addr,
             fault_opcode,
         });
     }
@@ -601,36 +1115,31 @@ impl Arm11Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::error::EmulatorError;
 
     fn mcr_cp15(crn: u32, rd: usize, crm: u32, opc2: u32) -> u32 {
         0xEE00_0010 | (crn << 16) | ((rd as u32) << 12) | (15 << 8) | (opc2 << 5) | crm
     }
 
     #[test]
-    fn instruction_fetch_faults_when_mmu_mapping_missing() {
+    fn instruction_fetch_fault_routes_to_prefetch_abort() {
         let mut cpu = Arm11Cpu::new();
         let mut memory = Memory::new();
 
         cpu.regs[0] = 0x0000_4000;
-        assert!(cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory)); // TTBR0
+        assert!(cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory));
         cpu.regs[0] = 0b01;
-        assert!(cpu.exec_coprocessor(mcr_cp15(3, 0, 0, 0), &mut memory)); // DACR
+        assert!(cpu.exec_coprocessor(mcr_cp15(3, 0, 0, 0), &mut memory));
         cpu.regs[0] = 1;
-        assert!(cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory)); // SCTLR.M
+        assert!(cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory));
 
         cpu.regs[PC_INDEX] = 0x0010_0000;
-        let err = cpu
-            .step(&mut memory)
-            .err()
-            .unwrap_or_else(|| panic!("expected fetch fault"));
+        cpu.step(&mut memory).expect("step must handle abort");
+        let ex = cpu.last_exception().expect("prefetch abort raised");
         assert_eq!(
-            err,
-            EmulatorError::MmuTranslationFault {
-                va: 0x0010_0000,
-                access: MemoryAccessKind::Execute,
-            }
+            ex.kind,
+            ExceptionKind::PrefetchAbort(FaultKind::Translation)
         );
+        assert_eq!(ex.vector, VECTOR_PABT);
     }
 
     #[test]
@@ -656,5 +1165,63 @@ mod tests {
         cpu.regs[0] = 0x0000_8000;
         cpu.exec_coprocessor(mcr_cp15(2, 0, 0, 0), &mut memory);
         assert_eq!(cpu.mmu.tlb_len(), 0);
+    }
+
+    #[test]
+    fn banked_sp_lr_switch_between_usr_and_irq() {
+        let mut cpu = Arm11Cpu::new();
+        cpu.regs[SP_INDEX] = 0x1000;
+        cpu.regs[LR_INDEX] = 0x2000;
+        cpu.switch_mode(MODE_IRQ);
+        cpu.regs[SP_INDEX] = 0x3000;
+        cpu.regs[LR_INDEX] = 0x4000;
+        cpu.switch_mode(MODE_USR);
+        assert_eq!(cpu.regs[SP_INDEX], 0x1000);
+        assert_eq!(cpu.regs[LR_INDEX], 0x2000);
+    }
+
+    #[test]
+    fn thumb_fixture_conformance_sequence() {
+        let mut cpu = Arm11Cpu::new();
+        let mut mem = Memory::new();
+        cpu.cpsr |= FLAG_T;
+        cpu.regs[PC_INDEX] = 0x0000_0000;
+
+        // mov r0, #5 ; add r0,#3 ; sub r0,#1 ; b +0
+        mem.write_u8(0, 0x05);
+        mem.write_u8(1, 0x20);
+        mem.write_u8(2, 0x03);
+        mem.write_u8(3, 0x30);
+        mem.write_u8(4, 0x01);
+        mem.write_u8(5, 0x38);
+        mem.write_u8(6, 0x00);
+        mem.write_u8(7, 0xE0);
+
+        for _ in 0..3 {
+            cpu.step(&mut mem).expect("thumb step");
+        }
+
+        assert_eq!(cpu.regs[0], 7);
+    }
+
+    #[test]
+    fn boot_trace_replay_records_first_failure_context() {
+        let mut cpu = Arm11Cpu::new();
+        let mut mem = Memory::new();
+        cpu.enable_instruction_trace(8);
+        cpu.regs[PC_INDEX] = 0;
+
+        mem.write_u32(0, 0xE3A00001); // mov r0,#1
+        mem.write_u32(4, 0xEF000011); // swi
+
+        cpu.step(&mut mem).expect("mov executes");
+        cpu.step(&mut mem).expect("swi executes");
+
+        assert_eq!(cpu.instruction_trace().len(), 2);
+        assert_eq!(cpu.instruction_trace()[0].pc, 0);
+        assert!(matches!(
+            cpu.last_exception().expect("swi exception").kind,
+            ExceptionKind::SoftwareInterrupt
+        ));
     }
 }
