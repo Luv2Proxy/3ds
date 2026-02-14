@@ -6,7 +6,6 @@ pub use crate::core::cpu::{CpuException, CpuRunState, ExceptionKind};
 pub use crate::core::emulator::{Emulator3ds, EmulatorConfig, EmulatorState};
 pub use crate::core::error::EmulatorError;
 pub use crate::core::kernel::{ServiceCall, ServiceEvent};
-pub use crate::core::pica::GpuCommand;
 pub use crate::core::timing::TimingSnapshot;
 
 #[derive(Default)]
@@ -35,9 +34,8 @@ impl Wasm3ds {
         self.inner.run_cycles(cycles).map_err(|e| e.to_string())
     }
 
-    pub fn enqueue_gpu_draw_point(&mut self, x: u16, y: u16, color: u32) {
-        self.inner
-            .enqueue_gpu_command(GpuCommand::DrawPoint { x, y, color });
+    pub fn enqueue_gpu_fifo_words(&mut self, words: &[u32]) {
+        self.inner.enqueue_gpu_fifo_words(words);
     }
 
     pub fn read_phys_u8(&self, addr: u32) -> u8 {

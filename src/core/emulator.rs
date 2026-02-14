@@ -5,7 +5,7 @@ use super::fs::TitlePackage;
 use super::kernel::{Kernel, ServiceEvent};
 use super::loader::load_process_from_rom;
 use super::memory::Memory;
-use super::pica::{GpuCommand, PicaGpu};
+use super::pica::PicaGpu;
 use super::rom::RomImage;
 use super::scheduler::Scheduler;
 use super::timing::{TimingModel, TimingSnapshot};
@@ -105,12 +105,8 @@ impl Emulator3ds {
         self.load_rom(rom)
     }
 
-    pub fn enqueue_gpu_command(&mut self, cmd: GpuCommand) {
-        self.gpu.enqueue_command(cmd);
-    }
-
-    pub fn set_gpu_shader_constant(&mut self, color: u32) {
-        self.gpu.set_shader_constant(color);
+    pub fn enqueue_gpu_fifo_words(&mut self, words: &[u32]) {
+        self.gpu.enqueue_gsp_fifo_words(words);
     }
 
     pub fn run_cycles(&mut self, budget: u32) -> Result<u32> {
@@ -127,8 +123,8 @@ impl Emulator3ds {
             self.kernel.tick(consumed);
             self.timing.tick(consumed);
             self.kernel.pump_ipc_events(1);
-            for cmd in self.kernel.drain_gpu_handoff() {
-                self.gpu.enqueue_command(cmd);
+            for fifo_words in self.kernel.drain_gpu_handoff() {
+                self.gpu.enqueue_gsp_fifo_words(&fifo_words);
             }
             self.gpu.tick(self.scheduler.cycles());
             self.dsp.tick(self.scheduler.cycles());
@@ -234,6 +230,7 @@ impl Emulator3ds {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::pica::PicaCommandBufferPacket;
 
     fn valid_rom() -> Vec<u8> {
         let mut rom = vec![0_u8; 0x5000];
@@ -302,13 +299,16 @@ mod tests {
 
         emu.load_title_package(&pkg)
             .unwrap_or_else(|e| panic!("load title works: {e}"));
-        emu.set_gpu_shader_constant(0x0000_00FF);
-        emu.enqueue_gpu_command(GpuCommand::Clear(0xFF11_2233));
-        emu.enqueue_gpu_command(GpuCommand::DrawPoint {
-            x: 1,
-            y: 1,
-            color: 0xFF44_5566,
-        });
+        emu.enqueue_gpu_fifo_words(&[
+            PicaCommandBufferPacket::encode(0x0301, 1, false),
+            0x0000_00FF,
+            PicaCommandBufferPacket::encode(0x0200, 1, false),
+            0xFF11_2233,
+            PicaCommandBufferPacket::encode(0x0201, 1, false),
+            (1 << 16) | 1,
+            PicaCommandBufferPacket::encode(0x0202, 1, false),
+            0xFF44_5566,
+        ]);
         emu.run_cycles(8)
             .unwrap_or_else(|e| panic!("run works: {e}"));
 

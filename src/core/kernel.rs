@@ -4,7 +4,7 @@ use super::ipc::{
     CommandBuffer, CommandHeader, Handle, IpcPort, IpcSession, ProcessId, RESULT_INVALID_COMMAND,
     RESULT_INVALID_HANDLE, RESULT_NOT_FOUND, RESULT_OK, service_name_from_words,
 };
-use super::pica::GpuCommand;
+use super::pica::PicaCommandBufferPacket;
 
 const KERNEL_PROCESS_ID: ProcessId = 1;
 
@@ -66,7 +66,7 @@ pub struct Kernel {
     processes: HashMap<ProcessId, ProcessState>,
     service_ports: HashMap<String, (ProcessId, Handle)>,
     app_state: u32,
-    gpu_handoff: VecDeque<GpuCommand>,
+    gpu_handoff: VecDeque<Vec<u32>>,
 }
 
 impl Kernel {
@@ -219,7 +219,7 @@ impl Kernel {
         self.svc_log.len()
     }
 
-    pub fn drain_gpu_handoff(&mut self) -> Vec<GpuCommand> {
+    pub fn drain_gpu_handoff(&mut self) -> Vec<Vec<u32>> {
         self.gpu_handoff.drain(..).collect()
     }
 
@@ -318,7 +318,22 @@ impl Kernel {
         match cmd.header.command_id {
             0x0001 => {
                 let color = cmd.words.first().copied().unwrap_or(0xFF00_0000);
-                self.gpu_handoff.push_back(GpuCommand::Clear(color));
+                self.gpu_handoff.push_back(vec![
+                    PicaCommandBufferPacket::encode(0x0200, 1, false),
+                    color,
+                ]);
+                (RESULT_OK, vec![])
+            }
+            0x0002 => {
+                if cmd.words.len() < 3 {
+                    return (RESULT_INVALID_COMMAND, vec![]);
+                }
+                self.gpu_handoff.push_back(vec![
+                    PicaCommandBufferPacket::encode(0x0201, 1, false),
+                    (cmd.words[1] << 16) | (cmd.words[0] & 0xFFFF),
+                    PicaCommandBufferPacket::encode(0x0202, 1, false),
+                    cmd.words[2],
+                ]);
                 (RESULT_OK, vec![])
             }
             _ => (RESULT_INVALID_COMMAND, vec![]),
