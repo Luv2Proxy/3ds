@@ -1,4 +1,5 @@
 pub mod cpu;
+pub mod diagnostics;
 pub mod dma;
 pub mod dsp;
 pub mod emulator;

@@ -74,6 +74,14 @@ pub struct InstructionTraceEntry {
     pub thumb: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmuFaultDetail {
+    pub va: u32,
+    pub pa: Option<u32>,
+    pub access: MemoryAccessKind,
+    pub kind: FaultKind,
+}
+
 #[derive(Clone)]
 pub struct Arm11Cpu {
     regs: [u32; REG_COUNT],
@@ -99,6 +107,8 @@ pub struct Arm11Cpu {
     trace_enabled: bool,
     trace_limit: usize,
     trace_log: Vec<InstructionTraceEntry>,
+    last_trace_entry: Option<InstructionTraceEntry>,
+    last_mmu_fault: Option<MmuFaultDetail>,
 }
 
 impl Default for Arm11Cpu {
@@ -133,6 +143,8 @@ impl Arm11Cpu {
             trace_enabled: false,
             trace_limit: 0,
             trace_log: Vec::new(),
+            last_trace_entry: None,
+            last_mmu_fault: None,
         }
     }
 
@@ -159,6 +171,8 @@ impl Arm11Cpu {
         self.cp15_regs = [0; 16];
         self.mmu.reset();
         self.trace_log.clear();
+        self.last_trace_entry = None;
+        self.last_mmu_fault = None;
     }
 
     pub fn enable_instruction_trace(&mut self, limit: usize) {
@@ -169,6 +183,14 @@ impl Arm11Cpu {
 
     pub fn instruction_trace(&self) -> &[InstructionTraceEntry] {
         &self.trace_log
+    }
+
+    pub fn take_last_instruction_trace(&mut self) -> Option<InstructionTraceEntry> {
+        self.last_trace_entry.take()
+    }
+
+    pub fn take_last_mmu_fault(&mut self) -> Option<MmuFaultDetail> {
+        self.last_mmu_fault.take()
     }
 
     pub fn run_state(&self) -> CpuRunState {
@@ -204,6 +226,8 @@ impl Arm11Cpu {
     }
 
     pub fn step(&mut self, memory: &mut Memory) -> Result<u32> {
+        self.last_trace_entry = None;
+        self.last_mmu_fault = None;
         if self.state == CpuRunState::Halted {
             return Ok(1);
         }
@@ -325,6 +349,7 @@ impl Arm11Cpu {
         }
         self.trace_log
             .push(InstructionTraceEntry { pc, opcode, thumb });
+        self.last_trace_entry = Some(InstructionTraceEntry { pc, opcode, thumb });
         if self.trace_log.len() > self.trace_limit {
             let excess = self.trace_log.len() - self.trace_limit;
             self.trace_log.drain(0..excess);
@@ -367,7 +392,16 @@ impl Arm11Cpu {
     ) -> std::result::Result<u32, FaultKind> {
         self.mmu
             .translate(memory, va, access.clone(), self.is_privileged())
-            .map_err(Self::fault_kind_from_error)
+            .map_err(|err| {
+                let kind = Self::fault_kind_from_error(err.clone());
+                self.last_mmu_fault = Some(MmuFaultDetail {
+                    va,
+                    pa: None,
+                    access,
+                    kind,
+                });
+                kind
+            })
     }
 
     fn fault_kind_from_error(err: EmulatorError) -> FaultKind {
@@ -819,14 +853,18 @@ impl Arm11Cpu {
         let address = (self.regs[PC_INDEX] & !3).wrapping_add(imm);
         if address & 3 != 0 {
             return Err(EmulatorError::AlignmentFault {
+                pc: self.pc(),
                 va: address,
+                pa: None,
                 access: MemoryAccessKind::Read,
             });
         }
         let pa = self
             .translate_va(memory, address, MemoryAccessKind::Read)
             .map_err(|_| EmulatorError::MmuTranslationFault {
+                pc: self.pc(),
                 va: address,
+                pa: None,
                 access: MemoryAccessKind::Read,
             })?;
         self.regs[rd] = memory.read_u32_checked(pa)?;

@@ -3,6 +3,10 @@
 mod core;
 
 pub use crate::core::cpu::{CpuException, CpuRunState, ExceptionKind};
+pub use crate::core::diagnostics::{
+    BootCheckpoint, BootCheckpointSnapshot, FaultSnapshot, StructuredError, TraceCategory,
+    TracePayload, TraceRecord,
+};
 pub use crate::core::emulator::{Emulator3ds, EmulatorConfig, EmulatorState};
 pub use crate::core::error::EmulatorError;
 pub use crate::core::kernel::{ServiceCall, ServiceEvent};
@@ -97,6 +101,10 @@ impl Wasm3ds {
 
     pub fn state_json(&self) -> String {
         self.inner.state_json()
+    }
+
+    pub fn diagnostics_json(&self) -> String {
+        self.inner.diagnostics_json()
     }
 
     pub fn reset(&mut self) {

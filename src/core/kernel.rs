@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
+use super::diagnostics::StructuredError;
 use super::fs::{ArchiveHandle, ArchiveId, FileHandle, VirtualFileSystem};
 use super::ipc::{
     CommandBuffer, CommandHeader, Handle, IpcPort, IpcSession, ProcessId, RESULT_INVALID_COMMAND,
@@ -69,6 +70,9 @@ pub struct Kernel {
     app_state: u32,
     gpu_handoff: VecDeque<Vec<u32>>,
     vfs: VirtualFileSystem,
+    last_ipc: Option<(u16, Handle, u32)>,
+    last_service_imm24: Option<u32>,
+    last_error: Option<StructuredError>,
 }
 
 impl Kernel {
@@ -77,6 +81,9 @@ impl Kernel {
             next_handle: 0x20,
             app_state: 1,
             vfs: VirtualFileSystem::default(),
+            last_ipc: None,
+            last_service_imm24: None,
+            last_error: None,
             ..Self::default()
         };
         kernel.ensure_process(KERNEL_PROCESS_ID);
@@ -100,6 +107,9 @@ impl Kernel {
         self.app_state = 1;
         self.gpu_handoff.clear();
         self.vfs = VirtualFileSystem::default();
+        self.last_ipc = None;
+        self.last_service_imm24 = None;
+        self.last_error = None;
         self.ensure_process(KERNEL_PROCESS_ID);
         self.bootstrap_services(KERNEL_PROCESS_ID);
     }
@@ -122,6 +132,7 @@ impl Kernel {
             call,
             argument: imm24,
         });
+        self.last_service_imm24 = Some(imm24);
     }
 
     pub fn pump_ipc_events(&mut self, budget: usize) {
@@ -138,7 +149,10 @@ impl Kernel {
                 break;
             };
 
+            let cmd_id = req.command.header.command_id;
+            let handle_id = req.session_handle;
             let (result_code, words) = self.dispatch_request(pid, req);
+            self.last_ipc = Some((cmd_id, handle_id, result_code));
             if let Some(proc_state) = self.processes.get_mut(&pid) {
                 proc_state.last_result_code = result_code;
                 proc_state
@@ -221,6 +235,22 @@ impl Kernel {
 
     pub fn service_call_count(&self) -> usize {
         self.svc_log.len()
+    }
+
+    pub fn take_last_ipc_dispatch(&mut self) -> Option<(u16, Handle, u32)> {
+        self.last_ipc.take()
+    }
+
+    pub fn take_last_service_imm24(&mut self) -> Option<u32> {
+        self.last_service_imm24.take()
+    }
+
+    pub fn report_error(&mut self, err: StructuredError) {
+        self.last_error = Some(err);
+    }
+
+    pub fn take_last_error(&mut self) -> Option<StructuredError> {
+        self.last_error.take()
     }
 
     pub fn mount_romfs(&mut self, romfs: super::fs::RomFs) {
