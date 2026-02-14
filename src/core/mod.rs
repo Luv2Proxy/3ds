@@ -1,9 +1,11 @@
 pub mod cpu;
+pub mod dma;
 pub mod dsp;
 pub mod emulator;
 pub mod error;
 pub mod fs;
 pub mod ipc;
+pub mod irq;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
