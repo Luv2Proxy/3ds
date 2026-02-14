@@ -136,6 +136,10 @@ impl ExeFs {
         let entry = self.entries.iter().find(|entry| entry.name == name)?;
         self.bytes.get(entry.offset..entry.offset + entry.size)
     }
+
+    pub fn entries(&self) -> &[ExeFsFile] {
+        &self.entries
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +219,10 @@ impl RomFs {
         let start = file.offset + offset;
         let end = start + read_len;
         self.bytes.get(start..end).map(|bytes| bytes.to_vec())
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 }
 
