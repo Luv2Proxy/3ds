@@ -77,6 +77,7 @@ impl Emulator3ds {
         self.memory.clear_writable();
         self.scheduler.reset();
         self.timing.reset();
+        self.kernel.reset_runtime();
         self.cpu.reset(0);
         self.rom_loaded = false;
     }
@@ -125,6 +126,10 @@ impl Emulator3ds {
             self.scheduler.tick(consumed);
             self.kernel.tick(consumed);
             self.timing.tick(consumed);
+            self.kernel.pump_ipc_events(1);
+            for cmd in self.kernel.drain_gpu_handoff() {
+                self.gpu.enqueue_command(cmd);
+            }
             self.gpu.tick(self.scheduler.cycles());
             self.dsp.tick(self.scheduler.cycles());
             executed += consumed;
