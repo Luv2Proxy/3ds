@@ -14,6 +14,15 @@ struct TlbEntry {
     pa_section: u32,
     domain: u8,
     ap: u8,
+    apx: bool,
+    execute_never: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AccessFlags {
+    ap: u8,
+    apx: bool,
+    execute_never: bool,
 }
 
 #[derive(Clone)]
@@ -78,6 +87,23 @@ impl Mmu {
         (self.control & 1) != 0
     }
 
+    pub fn translate_instruction(
+        &mut self,
+        memory: &Memory,
+        va: u32,
+        privileged: bool,
+    ) -> Result<u32> {
+        self.translate(memory, va, MemoryAccessKind::Execute, privileged)
+    }
+
+    pub fn translate_read(&mut self, memory: &Memory, va: u32, privileged: bool) -> Result<u32> {
+        self.translate(memory, va, MemoryAccessKind::Read, privileged)
+    }
+
+    pub fn translate_write(&mut self, memory: &Memory, va: u32, privileged: bool) -> Result<u32> {
+        self.translate(memory, va, MemoryAccessKind::Write, privileged)
+    }
+
     pub fn translate(
         &mut self,
         memory: &Memory,
@@ -110,6 +136,8 @@ impl Mmu {
                 pa_section: descriptor & SECTION_BASE_MASK,
                 domain: ((descriptor >> 5) & 0xF) as u8,
                 ap: ((descriptor >> 10) & 0x3) as u8,
+                apx: ((descriptor >> 15) & 1) != 0,
+                execute_never: ((descriptor >> 4) & 1) != 0,
             };
             self.tlb.insert(section_key, entry);
             entry
@@ -142,13 +170,33 @@ impl Mmu {
             _ => unreachable!(),
         }
 
-        let allowed = match entry.ap {
+        if entry.execute_never && matches!(access, MemoryAccessKind::Execute) {
+            return Err(EmulatorError::MmuPermissionFault {
+                pc: 0,
+                va,
+                pa: None,
+                access,
+            });
+        }
+
+        let flags = AccessFlags {
+            ap: entry.ap,
+            apx: entry.apx,
+            execute_never: entry.execute_never,
+        };
+        let allowed = match flags.ap {
             0b00 => false,
             0b01 => privileged,
             0b10 => {
                 privileged || matches!(access, MemoryAccessKind::Read | MemoryAccessKind::Execute)
             }
-            0b11 => true,
+            0b11 => {
+                if flags.apx {
+                    !matches!(access, MemoryAccessKind::Write)
+                } else {
+                    true
+                }
+            }
             _ => false,
         };
 
@@ -245,5 +293,64 @@ mod tests {
             .translate(&memory, 0x0000_1000, MemoryAccessKind::Read, true)
             .unwrap_or_else(|e| panic!("privileged read should succeed: {e}"));
         assert_eq!(pa, 0x0010_1000);
+    }
+
+    #[test]
+    fn execute_never_section_faults_on_instruction_fetch() {
+        let mut memory = Memory::new();
+        memory
+            .write_u32_checked(0x0000_4000, section_desc(0x0010_0000, 0, 0b11) | (1 << 4))
+            .unwrap_or_else(|e| panic!("write descriptor: {e}"));
+
+        let mut mmu = Mmu::new();
+        mmu.write_ttbr0(0x0000_4000);
+        mmu.write_dacr(0b01);
+        mmu.write_control(1);
+
+        let err = mmu
+            .translate_instruction(&memory, 0x0000_1000, true)
+            .err()
+            .unwrap_or_else(|| panic!("expected XN permission fault"));
+        assert_eq!(
+            err,
+            EmulatorError::MmuPermissionFault {
+                pc: 0,
+                va: 0x0000_1000,
+                pa: None,
+                access: MemoryAccessKind::Execute,
+            }
+        );
+    }
+
+    #[test]
+    fn apx_read_only_section_rejects_writes() {
+        let mut memory = Memory::new();
+        memory
+            .write_u32_checked(0x0000_4000, section_desc(0x0010_0000, 0, 0b11) | (1 << 15))
+            .unwrap_or_else(|e| panic!("write descriptor: {e}"));
+
+        let mut mmu = Mmu::new();
+        mmu.write_ttbr0(0x0000_4000);
+        mmu.write_dacr(0b01);
+        mmu.write_control(1);
+
+        let read_pa = mmu
+            .translate_read(&memory, 0x0000_1000, false)
+            .unwrap_or_else(|e| panic!("read should succeed: {e}"));
+        assert_eq!(read_pa, 0x0010_1000);
+
+        let err = mmu
+            .translate_write(&memory, 0x0000_1000, false)
+            .err()
+            .unwrap_or_else(|| panic!("expected permission fault"));
+        assert_eq!(
+            err,
+            EmulatorError::MmuPermissionFault {
+                pc: 0,
+                va: 0x0000_1000,
+                pa: None,
+                access: MemoryAccessKind::Write,
+            }
+        );
     }
 }
