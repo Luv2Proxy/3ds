@@ -165,6 +165,7 @@ pub struct PicaGpu {
     trace: Vec<GpuTraceEntry>,
     staged_point_xy: u32,
     staged_point_color: u32,
+    presents: u64,
 }
 
 impl Default for PicaGpu {
@@ -202,6 +203,7 @@ impl PicaGpu {
             trace: Vec::new(),
             staged_point_xy: 0,
             staged_point_color: 0xFFFF_FFFF,
+            presents: 0,
         }
     }
 
@@ -223,6 +225,14 @@ impl PicaGpu {
         for write in self.cmd.decode_command_words(&words) {
             self.apply_register_write(write);
         }
+    }
+
+    pub fn present(&mut self, frame_count: u64) {
+        self.presents = self.presents.saturating_add(frame_count);
+    }
+
+    pub fn presents(&self) -> u64 {
+        self.presents
     }
 
     fn apply_register_write(&mut self, write: PicaRegisterWrite) {

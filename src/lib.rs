@@ -6,7 +6,7 @@ pub use crate::core::cpu::{CpuException, CpuRunState, ExceptionKind};
 pub use crate::core::emulator::{Emulator3ds, EmulatorConfig, EmulatorState};
 pub use crate::core::error::EmulatorError;
 pub use crate::core::kernel::{ServiceCall, ServiceEvent};
-pub use crate::core::timing::TimingSnapshot;
+pub use crate::core::timing::{DriftCorrectionPolicy, TimingSnapshot};
 
 #[derive(Default)]
 pub struct Wasm3ds {
@@ -32,6 +32,39 @@ impl Wasm3ds {
 
     pub fn run_cycles(&mut self, cycles: u32) -> Result<u32, String> {
         self.inner.run_cycles(cycles).map_err(|e| e.to_string())
+    }
+
+    pub fn set_drift_policy(&mut self, max_frame_lead_us: i64, max_frame_lag_us: i64) {
+        self.inner.set_wasm_drift_policy(DriftCorrectionPolicy {
+            max_frame_lead_us,
+            max_frame_lag_us,
+        });
+    }
+
+    pub fn set_wall_time_anchor_us(&mut self, host_wall_time_us: u64) {
+        self.inner.set_wasm_wall_time_anchor_us(host_wall_time_us);
+    }
+
+    pub fn run_cycles_synced(
+        &mut self,
+        requested_cycles: u32,
+        host_wall_time_us: u64,
+    ) -> Result<u32, String> {
+        self.inner
+            .run_cycles_synced(requested_cycles, host_wall_time_us)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn take_audio_samples(&mut self) -> Vec<i16> {
+        self.inner.take_audio_samples()
+    }
+
+    pub fn take_frame_present_count(&mut self) -> u64 {
+        self.inner.take_frame_present_count()
+    }
+
+    pub fn take_audio_sample_count(&mut self) -> u64 {
+        self.inner.take_audio_sample_count()
     }
 
     pub fn enqueue_gpu_fifo_words(&mut self, words: &[u32]) {

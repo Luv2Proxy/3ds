@@ -11,7 +11,7 @@ use super::memory::Memory;
 use super::pica::PicaGpu;
 use super::rom::RomImage;
 use super::scheduler::{ScheduledDeviceEvent, Scheduler};
-use super::timing::{TimingModel, TimingSnapshot};
+use super::timing::{DriftCorrectionPolicy, TimingModel, TimingSnapshot};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EmulatorConfig {
@@ -40,6 +40,8 @@ pub struct Emulator3ds {
     rom_loaded: bool,
     vfs: VirtualFileSystem,
     config: EmulatorConfig,
+    frame_callbacks: u64,
+    audio_callbacks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +81,8 @@ impl Emulator3ds {
             rom_loaded: false,
             vfs: VirtualFileSystem::default(),
             config,
+            frame_callbacks: 0,
+            audio_callbacks: 0,
         }
     }
 
@@ -92,6 +96,8 @@ impl Emulator3ds {
         self.cpu.reset(0);
         self.rom_loaded = false;
         self.vfs = VirtualFileSystem::default();
+        self.frame_callbacks = 0;
+        self.audio_callbacks = 0;
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
@@ -104,6 +110,8 @@ impl Emulator3ds {
         self.irq.reset();
         self.dma.reset();
         self.timing.reset();
+        self.frame_callbacks = 0;
+        self.audio_callbacks = 0;
         self.rom_loaded = true;
         self.schedule_boot_events();
         Ok(())
@@ -198,7 +206,7 @@ impl Emulator3ds {
             let consumed = self.cpu.step(&mut self.memory)?;
             self.scheduler.tick(consumed);
             self.kernel.tick(consumed);
-            self.timing.tick(consumed);
+            let timing_tick = self.timing.tick(consumed);
             self.kernel.pump_ipc_events(1);
 
             for event in self.scheduler.drain_due_events() {
@@ -209,7 +217,18 @@ impl Emulator3ds {
                 self.gpu.enqueue_gsp_fifo_words(&fifo_words);
             }
             self.gpu.tick(self.scheduler.cycles());
-            self.dsp.tick(self.scheduler.cycles());
+            if timing_tick.video_frames > 0 {
+                self.gpu.present(timing_tick.video_frames);
+                self.frame_callbacks = self
+                    .frame_callbacks
+                    .saturating_add(timing_tick.video_frames);
+            }
+            if timing_tick.audio_samples > 0 {
+                self.dsp.produce_samples(timing_tick.audio_samples);
+                self.audio_callbacks = self
+                    .audio_callbacks
+                    .saturating_add(timing_tick.audio_samples);
+            }
             executed += consumed;
 
             if let Some(exception) = self.cpu.last_exception()
@@ -224,6 +243,42 @@ impl Emulator3ds {
         }
 
         Ok(executed)
+    }
+
+    pub fn set_wasm_drift_policy(&mut self, policy: DriftCorrectionPolicy) {
+        self.timing.set_drift_policy(policy);
+    }
+
+    pub fn set_wasm_wall_time_anchor_us(&mut self, host_wall_time_us: u64) {
+        self.timing.set_wall_time_anchor_us(host_wall_time_us);
+    }
+
+    pub fn run_cycles_synced(
+        &mut self,
+        requested_cycles: u32,
+        host_wall_time_us: u64,
+    ) -> Result<u32> {
+        let adjusted = self
+            .timing
+            .recommended_cycle_budget(host_wall_time_us, requested_cycles)
+            .min(self.config.max_cycle_budget);
+        self.run_cycles(adjusted)
+    }
+
+    pub fn take_audio_samples(&mut self) -> Vec<i16> {
+        self.dsp.take_samples()
+    }
+
+    pub fn take_frame_present_count(&mut self) -> u64 {
+        let count = self.frame_callbacks;
+        self.frame_callbacks = 0;
+        count
+    }
+
+    pub fn take_audio_sample_count(&mut self) -> u64 {
+        let count = self.audio_callbacks;
+        self.audio_callbacks = 0;
+        count
     }
 
     pub fn read_phys_u8(&self, addr: u32) -> u8 {
