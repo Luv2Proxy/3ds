@@ -106,7 +106,7 @@ impl Arm11Cpu {
         }
 
         let pc = self.pc();
-        let opcode = memory.read_u32(pc)?;
+        let opcode = memory.read_u32_checked(pc)?;
         self.regs[PC_INDEX] = pc.wrapping_add(4);
 
         if !self.condition_passed(opcode >> 28) {
@@ -260,9 +260,9 @@ impl Arm11Cpu {
 
         let address = if pre_index { effective } else { base };
         if load {
-            self.regs[rd] = memory.read_u32(address)?;
+            self.regs[rd] = memory.read_u32_checked(address)?;
         } else {
-            memory.write_u32(address, self.regs[rd])?;
+            memory.write_u32_checked(address, self.regs[rd])?;
         }
 
         if write_back || !pre_index {

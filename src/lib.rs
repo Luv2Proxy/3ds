@@ -40,6 +40,26 @@ impl Wasm3ds {
             .enqueue_gpu_command(GpuCommand::DrawPoint { x, y, color });
     }
 
+    pub fn read_phys_u8(&self, addr: u32) -> u8 {
+        self.inner.read_phys_u8(addr)
+    }
+
+    pub fn write_phys_u8(&mut self, addr: u32, value: u8) {
+        self.inner.write_phys_u8(addr, value);
+    }
+
+    pub fn read_phys_u32(&self, addr: u32) -> u32 {
+        self.inner.read_phys_u32(addr)
+    }
+
+    pub fn write_phys_u32(&mut self, addr: u32, value: u32) {
+        self.inner.write_phys_u32(addr, value);
+    }
+
+    pub fn mapped_memory_bytes(&self) -> usize {
+        self.inner.mapped_memory_bytes()
+    }
+
     pub fn frame_rgba(&self) -> Vec<u8> {
         self.inner.frame_rgba()
     }

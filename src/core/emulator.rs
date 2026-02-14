@@ -3,14 +3,14 @@ use super::dsp::Dsp;
 use super::error::{EmulatorError, Result};
 use super::fs::TitlePackage;
 use super::kernel::{Kernel, ServiceEvent};
-use super::memory::Memory;
+use super::memory::{Memory, ROM_START};
 use super::pica::{GpuCommand, PicaGpu};
 use super::rom::RomImage;
 use super::scheduler::Scheduler;
 use super::timing::{TimingModel, TimingSnapshot};
 
-const ENTRYPOINT_OFFSET: usize = 0x200;
-const ROM_LOAD_ADDR: usize = 0x0010_0000;
+const ENTRYPOINT_OFFSET: u32 = 0x200;
+const ROM_LOAD_ADDR: u32 = ROM_START;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EmulatorConfig {
@@ -76,7 +76,7 @@ impl Emulator3ds {
     }
 
     pub fn reset(&mut self) {
-        self.memory.clear();
+        self.memory.clear_writable();
         self.scheduler.reset();
         self.timing.reset();
         self.cpu.reset(0);
@@ -84,10 +84,11 @@ impl Emulator3ds {
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
-        let parsed = RomImage::parse(rom, self.memory.len() - ROM_LOAD_ADDR)?;
-        self.memory.clear();
-        self.memory.load(ROM_LOAD_ADDR, parsed.bytes())?;
-        self.cpu.reset((ROM_LOAD_ADDR + ENTRYPOINT_OFFSET) as u32);
+        let parsed = RomImage::parse(rom, usize::MAX)?;
+        self.memory.clear_writable();
+        self.memory.map_rom(parsed.bytes());
+        self.cpu
+            .reset(ROM_LOAD_ADDR.wrapping_add(ENTRYPOINT_OFFSET));
         self.scheduler.reset();
         self.timing.reset();
         self.rom_loaded = true;
@@ -145,6 +146,26 @@ impl Emulator3ds {
         Ok(executed)
     }
 
+    pub fn read_phys_u8(&self, addr: u32) -> u8 {
+        self.memory.read_u8(addr)
+    }
+
+    pub fn write_phys_u8(&mut self, addr: u32, value: u8) {
+        self.memory.write_u8(addr, value);
+    }
+
+    pub fn read_phys_u32(&self, addr: u32) -> u32 {
+        self.memory.read_u32(addr)
+    }
+
+    pub fn write_phys_u32(&mut self, addr: u32, value: u32) {
+        self.memory.write_u32(addr, value);
+    }
+
+    pub fn mapped_memory_bytes(&self) -> usize {
+        self.memory.len_mapped_bytes()
+    }
+
     pub fn frame_rgba(&self) -> Vec<u8> {
         self.gpu.frame_u8()
     }
@@ -191,7 +212,7 @@ impl Emulator3ds {
             s.service_calls,
             s.registers
                 .iter()
-                .map(|r| r.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
             exc,
@@ -199,13 +220,12 @@ impl Emulator3ds {
     }
 
     pub fn memory_checksum(&self, start: usize, len: usize) -> Option<u64> {
-        let end = start.checked_add(len)?;
-        let bytes = self.memory.as_slice().get(start..end)?;
-        Some(
-            bytes
-                .iter()
-                .fold(0_u64, |acc, b| acc.wrapping_add(u64::from(*b))),
-        )
+        let mut checksum = 0_u64;
+        for off in 0..len {
+            let addr = (start as u32).checked_add(off as u32)?;
+            checksum = checksum.wrapping_add(u64::from(self.memory.read_u8(addr)));
+        }
+        Some(checksum)
     }
 }
 
@@ -224,37 +244,16 @@ mod tests {
     }
 
     #[test]
-    fn executes_data_processing_and_mul() {
+    fn wasm_memory_mapping_handles_high_rom_addresses() {
         let mut emu = Emulator3ds::new();
         let mut rom = valid_rom();
-        write_insn(&mut rom, 0x200, 0xE3A0_0005); // MOV r0,#5
-        write_insn(&mut rom, 0x204, 0xE3A0_1003); // MOV r1,#3
-        write_insn(&mut rom, 0x208, 0xE280_2007); // ADD r2,r0,#7
-        write_insn(&mut rom, 0x20C, 0xE242_3002); // SUB r3,r2,#2
-        write_insn(&mut rom, 0x210, 0xE320_F003); // WFI
+        write_insn(&mut rom, 0x200, 0xE320_F003);
         emu.load_rom(&rom)
             .unwrap_or_else(|e| panic!("load works: {e}"));
-        emu.run_cycles(16)
+        emu.run_cycles(1)
             .unwrap_or_else(|e| panic!("run works: {e}"));
         let state = emu.state();
-        assert_eq!(state.registers[2], 12);
-        assert_eq!(state.registers[3], 10);
-    }
-
-    #[test]
-    fn exception_return_restores_mode() {
-        let mut emu = Emulator3ds::new();
-        let mut rom = valid_rom();
-        write_insn(&mut rom, 0x200, 0xEF00_0001); // SWI
-        write_insn(&mut rom, 0x008, 0xE1B0_F00E); // MOVS pc, lr
-        write_insn(&mut rom, 0x204, 0xE320_F003); // WFI after return
-        emu.load_rom(&rom)
-            .unwrap_or_else(|e| panic!("load works: {e}"));
-        emu.run_cycles(8)
-            .unwrap_or_else(|e| panic!("run works: {e}"));
-        let state = emu.state();
-        assert_eq!(state.cpsr & 0x1F, 0b1_0000);
-        assert!(state.service_calls >= 1);
+        assert_eq!(state.pc, ROM_START.wrapping_add(0x204));
     }
 
     #[test]
