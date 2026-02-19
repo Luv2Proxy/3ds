@@ -230,6 +230,9 @@ impl Emulator3ds {
                     self.irq.raise(IrqLine::Dma0);
                 }
             }
+            ScheduledDeviceEvent::ServiceWake { pid } => {
+                self.kernel.on_scheduler_wake(pid);
+            }
         }
     }
 
@@ -348,6 +351,12 @@ impl Emulator3ds {
                 && exception.kind == ExceptionKind::SoftwareInterrupt
             {
                 self.kernel.handle_swi(exception.fault_opcode & 0x00FF_FFFF);
+                for event in self.kernel.take_pending_schedule_events() {
+                    self.scheduler.schedule_in(
+                        event.delay_cycles,
+                        ScheduledDeviceEvent::ServiceWake { pid: event.pid },
+                    );
+                }
             }
 
             if let Some(fault) = self.cpu.take_last_mmu_fault() {

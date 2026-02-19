@@ -14,4 +14,5 @@ pub mod mmu;
 pub mod pica;
 pub mod rom;
 pub mod scheduler;
+pub mod services;
 pub mod timing;
