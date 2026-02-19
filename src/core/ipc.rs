@@ -8,6 +8,15 @@ pub const RESULT_NOT_FOUND: u32 = 0xD8A1_83F8;
 pub const RESULT_INVALID_HANDLE: u32 = 0xD8A1_83FA;
 pub const RESULT_INVALID_COMMAND: u32 = 0xD8A1_8404;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelObjectType {
+    Port,
+    Session,
+    Event,
+    Archive,
+    File,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcPort {
     pub name: String,
@@ -18,6 +27,12 @@ pub struct IpcPort {
 pub struct IpcSession {
     pub service: String,
     pub server_port: Handle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcEvent {
+    pub name: String,
+    pub signaled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +62,93 @@ impl CommandHeader {
 pub struct CommandBuffer {
     pub header: CommandHeader,
     pub words: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcDescriptor {
+    CopyHandle(Handle),
+    MoveHandle(Handle),
+    StaticBuffer { index: u8, address: u32, size: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcMessage {
+    pub command_id: u16,
+    pub normal_words: Vec<u32>,
+    pub descriptors: Vec<IpcDescriptor>,
+}
+
+impl IpcMessage {
+    pub fn parse(raw_words: &[u32]) -> Option<Self> {
+        let cmd = CommandBuffer::parse(raw_words)?;
+        let mut offset = 1 + usize::from(cmd.header.normal_words);
+        let mut consumed_translate = 0usize;
+        let mut descriptors = Vec::new();
+        while consumed_translate < usize::from(cmd.header.translate_words) {
+            let tag = *raw_words.get(offset)?;
+            offset += 1;
+            consumed_translate += 1;
+            let kind = (tag >> 28) & 0xF;
+            match kind {
+                0x8 => descriptors.push(IpcDescriptor::CopyHandle(tag & 0x0FFF_FFFF)),
+                0x9 => descriptors.push(IpcDescriptor::MoveHandle(tag & 0x0FFF_FFFF)),
+                0xA => {
+                    let address = *raw_words.get(offset)?;
+                    offset += 1;
+                    consumed_translate += 1;
+                    let size = tag & 0x00FF_FFFF;
+                    let index = ((tag >> 24) & 0xF) as u8;
+                    descriptors.push(IpcDescriptor::StaticBuffer {
+                        index,
+                        address,
+                        size,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        Some(Self {
+            command_id: cmd.header.command_id,
+            normal_words: cmd.words,
+            descriptors,
+        })
+    }
+
+    pub fn into_words(self) -> Vec<u32> {
+        let translate_words = self
+            .descriptors
+            .iter()
+            .map(|d| match d {
+                IpcDescriptor::StaticBuffer { .. } => 2,
+                _ => 1,
+            })
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(1 + self.normal_words.len() + translate_words);
+        out.push(
+            CommandHeader {
+                command_id: self.command_id,
+                normal_words: self.normal_words.len() as u16,
+                translate_words: translate_words as u8,
+            }
+            .encode(),
+        );
+        out.extend(self.normal_words);
+        for descriptor in self.descriptors {
+            match descriptor {
+                IpcDescriptor::CopyHandle(handle) => out.push(0x8000_0000 | (handle & 0x0FFF_FFFF)),
+                IpcDescriptor::MoveHandle(handle) => out.push(0x9000_0000 | (handle & 0x0FFF_FFFF)),
+                IpcDescriptor::StaticBuffer {
+                    index,
+                    address,
+                    size,
+                } => {
+                    out.push(0xA000_0000 | (u32::from(index & 0xF) << 24) | (size & 0x00FF_FFFF));
+                    out.push(address);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl CommandBuffer {
@@ -131,5 +233,25 @@ mod tests {
         let cmd = CommandBuffer::parse(&[0x0002_0001, 1, 2]).expect("valid parse");
         assert_eq!(cmd.header.command_id, 1);
         assert_eq!(cmd.words, vec![1, 2]);
+    }
+
+    #[test]
+    fn ipc_message_roundtrip_with_descriptors() {
+        let msg = IpcMessage {
+            command_id: 0x22,
+            normal_words: vec![0xDEAD_BEEF, 0xCAFE_BABE],
+            descriptors: vec![
+                IpcDescriptor::CopyHandle(0x44),
+                IpcDescriptor::MoveHandle(0x45),
+                IpcDescriptor::StaticBuffer {
+                    index: 3,
+                    address: 0x1234_0000,
+                    size: 0x100,
+                },
+            ],
+        };
+        let words = msg.clone().into_words();
+        let parsed = IpcMessage::parse(&words).expect("message parse");
+        assert_eq!(parsed, msg);
     }
 }

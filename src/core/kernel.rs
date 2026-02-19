@@ -3,8 +3,9 @@ use std::collections::{HashMap, VecDeque};
 use super::diagnostics::StructuredError;
 use super::fs::{ArchiveHandle, ArchiveId, FileHandle, VirtualFileSystem};
 use super::ipc::{
-    CommandBuffer, CommandHeader, Handle, IpcPort, IpcSession, ProcessId, RESULT_INVALID_COMMAND,
-    RESULT_INVALID_HANDLE, RESULT_NOT_FOUND, RESULT_OK, service_name_from_words,
+    Handle, IpcEvent, IpcMessage, IpcPort, IpcSession, KernelObjectType, ProcessId,
+    RESULT_INVALID_COMMAND, RESULT_INVALID_HANDLE, RESULT_NOT_FOUND, RESULT_OK,
+    service_name_from_words,
 };
 use super::pica::PicaCommandBufferPacket;
 
@@ -15,6 +16,9 @@ pub enum ServiceCall {
     Yield,
     GetTick,
     SendSyncRequest,
+    CreateEvent,
+    DuplicateHandle,
+    CloseHandle,
     Unknown(u32),
 }
 
@@ -36,6 +40,7 @@ enum ServiceTarget {
 enum KernelObject {
     Port(ServiceTarget),
     Session(ServiceTarget),
+    Event(IpcEvent),
     Archive(ArchiveHandle),
     File(FileHandle),
 }
@@ -49,7 +54,7 @@ pub struct IpcResponse {
 #[derive(Debug, Clone)]
 struct IpcRequest {
     session_handle: Handle,
-    command: CommandBuffer,
+    message: IpcMessage,
 }
 
 #[derive(Clone, Default)]
@@ -119,15 +124,7 @@ impl Kernel {
     }
 
     pub fn handle_swi(&mut self, imm24: u32) {
-        let call = match imm24 {
-            0x00 => ServiceCall::Yield,
-            0x01 => ServiceCall::GetTick,
-            0x32 => {
-                self.pump_ipc_events(1);
-                ServiceCall::SendSyncRequest
-            }
-            other => ServiceCall::Unknown(other),
-        };
+        let call = self.dispatch_syscall(1, imm24, &[]);
         self.svc_log.push(ServiceEvent {
             call,
             argument: imm24,
@@ -149,7 +146,7 @@ impl Kernel {
                 break;
             };
 
-            let cmd_id = req.command.header.command_id;
+            let cmd_id = req.message.command_id;
             let handle_id = req.session_handle;
             let (result_code, words) = self.dispatch_request(pid, req);
             self.last_ipc = Some((cmd_id, handle_id, result_code));
@@ -164,19 +161,45 @@ impl Kernel {
 
     pub fn queue_ipc_command(&mut self, pid: ProcessId, session_handle: Handle, words: Vec<u32>) {
         self.ensure_process(pid);
-        let command = CommandBuffer::parse(&words).unwrap_or(CommandBuffer {
-            header: CommandHeader {
-                command_id: 0,
-                normal_words: 0,
-                translate_words: 0,
-            },
-            words: vec![],
+        let message = IpcMessage::parse(&words).unwrap_or(IpcMessage {
+            command_id: 0,
+            normal_words: vec![],
+            descriptors: vec![],
         });
         if let Some(proc_state) = self.processes.get_mut(&pid) {
             proc_state.pending_requests.push_back(IpcRequest {
                 session_handle,
-                command,
+                message,
             });
+        }
+    }
+
+    pub fn dispatch_syscall(&mut self, pid: ProcessId, imm24: u32, args: &[u32]) -> ServiceCall {
+        self.ensure_process(pid);
+        match imm24 {
+            0x00 => ServiceCall::Yield,
+            0x01 => ServiceCall::GetTick,
+            0x23 => {
+                let _ = self.create_event(pid, "svc:event");
+                ServiceCall::CreateEvent
+            }
+            0x27 => {
+                if let Some(&handle) = args.first() {
+                    let _ = self.duplicate_handle(pid, handle);
+                }
+                ServiceCall::DuplicateHandle
+            }
+            0x29 => {
+                if let Some(&handle) = args.first() {
+                    let _ = self.close_handle(pid, handle);
+                }
+                ServiceCall::CloseHandle
+            }
+            0x32 => {
+                self.pump_ipc_events(1);
+                ServiceCall::SendSyncRequest
+            }
+            other => ServiceCall::Unknown(other),
         }
     }
 
@@ -260,6 +283,40 @@ impl Kernel {
         self.gpu_handoff.drain(..).collect()
     }
 
+    pub fn create_event(&mut self, pid: ProcessId, name: &str) -> Handle {
+        self.allocate_handle(
+            pid,
+            KernelObject::Event(IpcEvent {
+                name: name.to_string(),
+                signaled: false,
+            }),
+        )
+    }
+
+    pub fn duplicate_handle(&mut self, pid: ProcessId, handle: Handle) -> Option<Handle> {
+        let obj = self.lookup_object(pid, handle)?;
+        Some(self.allocate_handle(pid, obj))
+    }
+
+    pub fn close_handle(&mut self, pid: ProcessId, handle: Handle) -> bool {
+        self.processes
+            .get_mut(&pid)
+            .and_then(|p| p.handles.remove(&handle))
+            .is_some()
+    }
+
+    pub fn handle_type(&self, pid: ProcessId, handle: Handle) -> Option<KernelObjectType> {
+        let obj = self.lookup_object(pid, handle)?;
+        let kind = match obj {
+            KernelObject::Port(_) => KernelObjectType::Port,
+            KernelObject::Session(_) => KernelObjectType::Session,
+            KernelObject::Event(_) => KernelObjectType::Event,
+            KernelObject::Archive(_) => KernelObjectType::Archive,
+            KernelObject::File(_) => KernelObjectType::File,
+        };
+        Some(kind)
+    }
+
     fn allocate_handle(&mut self, pid: ProcessId, object: KernelObject) -> Handle {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
@@ -282,29 +339,29 @@ impl Kernel {
         };
 
         match target {
-            ServiceTarget::Srv => self.dispatch_srv(pid, req.command),
-            ServiceTarget::Fs => self.dispatch_fs(pid, req.command),
-            ServiceTarget::Apt => self.dispatch_apt(req.command),
-            ServiceTarget::GspGpu => self.dispatch_gsp(req.command),
+            ServiceTarget::Srv => self.dispatch_srv(pid, req.message),
+            ServiceTarget::Fs => self.dispatch_fs(pid, req.message),
+            ServiceTarget::Apt => self.dispatch_apt(req.message),
+            ServiceTarget::GspGpu => self.dispatch_gsp(req.message),
         }
     }
 
-    fn dispatch_srv(&mut self, pid: ProcessId, cmd: CommandBuffer) -> (u32, Vec<u32>) {
-        match cmd.header.command_id {
+    fn dispatch_srv(&mut self, pid: ProcessId, msg: IpcMessage) -> (u32, Vec<u32>) {
+        match msg.command_id {
             0x0001 => {
-                if cmd.words.len() < 3 {
+                if msg.normal_words.len() < 3 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
-                let name = service_name_from_words(&cmd.words[..2]);
-                let max_sessions = cmd.words[2];
+                let name = service_name_from_words(&msg.normal_words[..2]);
+                let max_sessions = msg.normal_words[2];
                 let port = self.register_service_port(pid, &name, max_sessions);
                 (RESULT_OK, vec![port])
             }
             0x0005 => {
-                if cmd.words.len() < 2 {
+                if msg.normal_words.len() < 2 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
-                let name = service_name_from_words(&cmd.words[..2]);
+                let name = service_name_from_words(&msg.normal_words[..2]);
                 match self.connect_to_service(pid, &name) {
                     Some(handle) => (RESULT_OK, vec![handle]),
                     None => (RESULT_NOT_FOUND, vec![]),
@@ -314,10 +371,14 @@ impl Kernel {
         }
     }
 
-    fn dispatch_fs(&mut self, pid: ProcessId, cmd: CommandBuffer) -> (u32, Vec<u32>) {
-        match cmd.header.command_id {
+    fn dispatch_fs(&mut self, pid: ProcessId, msg: IpcMessage) -> (u32, Vec<u32>) {
+        match msg.command_id {
             0x0001 => {
-                let archive_id = cmd.words.first().copied().unwrap_or(ArchiveId::Sdmc as u32);
+                let archive_id = msg
+                    .normal_words
+                    .first()
+                    .copied()
+                    .unwrap_or(ArchiveId::Sdmc as u32);
                 let Some(archive_obj) = self.vfs.open_archive(archive_id) else {
                     return (RESULT_NOT_FOUND, vec![]);
                 };
@@ -325,23 +386,24 @@ impl Kernel {
                 (RESULT_OK, vec![archive])
             }
             0x0002 => {
-                if cmd.words.len() < 2 {
+                if msg.normal_words.len() < 2 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
-                let archive_handle = cmd.words[0];
+                let archive_handle = msg.normal_words[0];
                 let Some(KernelObject::Archive(archive_obj)) =
                     self.lookup_object(pid, archive_handle)
                 else {
                     return (RESULT_INVALID_HANDLE, vec![]);
                 };
-                let translated = self
-                    .vfs
-                    .translate_path(archive_obj.archive, &format!("/{:08x}", cmd.words[1]));
+                let translated = self.vfs.translate_path(
+                    archive_obj.archive,
+                    &format!("/{:08x}", msg.normal_words[1]),
+                );
                 let Some(file_obj) = self.vfs.open_file(archive_obj, &translated) else {
                     if archive_obj.archive == ArchiveId::RomFs {
                         return (RESULT_NOT_FOUND, vec![]);
                     }
-                    let fallback_path = format!("/{:08x}", cmd.words[1]);
+                    let fallback_path = format!("/{:08x}", msg.normal_words[1]);
                     let file_obj = self
                         .vfs
                         .open_file(archive_obj, &fallback_path)
@@ -356,21 +418,21 @@ impl Kernel {
         }
     }
 
-    fn dispatch_apt(&mut self, cmd: CommandBuffer) -> (u32, Vec<u32>) {
-        match cmd.header.command_id {
+    fn dispatch_apt(&mut self, msg: IpcMessage) -> (u32, Vec<u32>) {
+        match msg.command_id {
             0x0001 => (RESULT_OK, vec![self.app_state]),
             0x0002 => {
-                self.app_state = cmd.words.first().copied().unwrap_or(self.app_state);
+                self.app_state = msg.normal_words.first().copied().unwrap_or(self.app_state);
                 (RESULT_OK, vec![self.app_state])
             }
             _ => (RESULT_INVALID_COMMAND, vec![]),
         }
     }
 
-    fn dispatch_gsp(&mut self, cmd: CommandBuffer) -> (u32, Vec<u32>) {
-        match cmd.header.command_id {
+    fn dispatch_gsp(&mut self, msg: IpcMessage) -> (u32, Vec<u32>) {
+        match msg.command_id {
             0x0001 => {
-                let color = cmd.words.first().copied().unwrap_or(0xFF00_0000);
+                let color = msg.normal_words.first().copied().unwrap_or(0xFF00_0000);
                 self.gpu_handoff.push_back(vec![
                     PicaCommandBufferPacket::encode(0x0200, 1, false),
                     color,
@@ -378,14 +440,14 @@ impl Kernel {
                 (RESULT_OK, vec![])
             }
             0x0002 => {
-                if cmd.words.len() < 3 {
+                if msg.normal_words.len() < 3 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
                 self.gpu_handoff.push_back(vec![
                     PicaCommandBufferPacket::encode(0x0201, 1, false),
-                    (cmd.words[1] << 16) | (cmd.words[0] & 0xFFFF),
+                    (msg.normal_words[1] << 16) | (msg.normal_words[0] & 0xFFFF),
                     PicaCommandBufferPacket::encode(0x0202, 1, false),
-                    cmd.words[2],
+                    msg.normal_words[2],
                 ]);
                 (RESULT_OK, vec![])
             }
@@ -397,17 +459,15 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ipc::{CommandHeader, service_name_words};
+    use crate::core::ipc::{IpcMessage, KernelObjectType, service_name_words};
 
     fn mk_command(command_id: u16, payload: &[u32]) -> Vec<u32> {
-        let header = CommandHeader {
+        IpcMessage {
             command_id,
-            normal_words: payload.len() as u16,
-            translate_words: 0,
-        };
-        let mut words = vec![header.encode()];
-        words.extend_from_slice(payload);
-        words
+            normal_words: payload.to_vec(),
+            descriptors: vec![],
+        }
+        .into_words()
     }
 
     #[test]
@@ -467,5 +527,58 @@ mod tests {
         let app_state = kernel.pop_ipc_response(pid).expect("app state");
         assert_eq!(app_state.result_code, RESULT_OK);
         assert_eq!(app_state.words[0], 1);
+    }
+
+    #[test]
+    fn handle_validity_duplicate_and_close() {
+        let mut kernel = Kernel::new();
+        let pid_a = 100;
+        let pid_b = 101;
+        kernel.ensure_process(pid_a);
+        kernel.ensure_process(pid_b);
+
+        let event = kernel.create_event(pid_a, "unit:event");
+        assert_eq!(
+            kernel.handle_type(pid_a, event),
+            Some(KernelObjectType::Event)
+        );
+        assert_eq!(kernel.handle_type(pid_b, event), None);
+
+        let dup = kernel
+            .duplicate_handle(pid_a, event)
+            .expect("duplicate event");
+        assert_ne!(dup, event);
+        assert_eq!(
+            kernel.handle_type(pid_a, dup),
+            Some(KernelObjectType::Event)
+        );
+
+        assert!(kernel.close_handle(pid_a, event));
+        assert_eq!(kernel.handle_type(pid_a, event), None);
+        assert_eq!(
+            kernel.handle_type(pid_a, dup),
+            Some(KernelObjectType::Event)
+        );
+    }
+
+    #[test]
+    fn service_session_lifecycle() {
+        let mut kernel = Kernel::new();
+        let pid = 77;
+        kernel.ensure_process(pid);
+
+        let srv = kernel.connect_to_service(pid, "srv:").expect("srv session");
+        assert_eq!(
+            kernel.handle_type(pid, srv),
+            Some(KernelObjectType::Session)
+        );
+
+        assert!(kernel.close_handle(pid, srv));
+        assert_eq!(kernel.handle_type(pid, srv), None);
+
+        kernel.queue_ipc_command(pid, srv, mk_command(0x0005, &service_name_words("fs:")));
+        kernel.pump_ipc_events(1);
+        let failed = kernel.pop_ipc_response(pid).expect("response after close");
+        assert_eq!(failed.result_code, RESULT_INVALID_HANDLE);
     }
 }
