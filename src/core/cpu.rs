@@ -279,6 +279,17 @@ impl Arm11Cpu {
             return Ok(2);
         }
 
+        if (opcode >> 25) & 0x7 == 0b100 {
+            return match self.exec_block_data_transfer(opcode, memory) {
+                Ok(true) => Ok(4),
+                Ok(false) => Ok(1),
+                Err(kind) => {
+                    self.take_data_abort(kind, pc, opcode);
+                    Ok(3)
+                }
+            };
+        }
+
         if (opcode >> 26) & 0x3 == 0b01 {
             return match self.exec_single_data_transfer(opcode, memory) {
                 Ok(_) => Ok(3),
@@ -309,6 +320,14 @@ impl Arm11Cpu {
             }
             if self.exec_multiply(opcode) {
                 return Ok(2);
+            }
+            match self.exec_swap(opcode, memory) {
+                Ok(true) => return Ok(3),
+                Ok(false) => {}
+                Err(kind) => {
+                    self.take_data_abort(kind, pc, opcode);
+                    return Ok(3);
+                }
             }
         }
 
@@ -468,6 +487,9 @@ impl Arm11Cpu {
         }
 
         if opcode & 0x0FF0_00F0 == 0x0160_0010 {
+            let rd = ((opcode >> 12) & 0xF) as usize;
+            let rm = (opcode & 0xF) as usize;
+            self.regs[rd] = self.regs[rm].leading_zeros();
             return true;
         }
 
@@ -730,6 +752,120 @@ impl Arm11Cpu {
         Ok(true)
     }
 
+    fn exec_swap(
+        &mut self,
+        opcode: u32,
+        memory: &mut Memory,
+    ) -> std::result::Result<bool, FaultKind> {
+        if opcode & 0x0FB0_0FF0 != 0x0100_0090 {
+            return Ok(false);
+        }
+        let is_byte = ((opcode >> 22) & 1) != 0;
+        let rn = ((opcode >> 16) & 0xF) as usize;
+        let rd = ((opcode >> 12) & 0xF) as usize;
+        let rm = (opcode & 0xF) as usize;
+        let addr = self.regs[rn];
+
+        if !is_byte && (addr & 3) != 0 {
+            return Err(FaultKind::Alignment);
+        }
+
+        if is_byte {
+            let pa = self.translate_va(memory, addr, MemoryAccessKind::Read)?;
+            let old = memory
+                .read_u8_checked(pa)
+                .map_err(|_| FaultKind::Translation)?;
+            let pa = self.translate_va(memory, addr, MemoryAccessKind::Write)?;
+            memory
+                .write_u8_checked(pa, (self.regs[rm] & 0xFF) as u8)
+                .map_err(|_| FaultKind::Translation)?;
+            self.regs[rd] = u32::from(old);
+        } else {
+            let pa = self.translate_va(memory, addr, MemoryAccessKind::Read)?;
+            let old = memory
+                .read_u32_checked(pa)
+                .map_err(|_| FaultKind::Translation)?;
+            let pa = self.translate_va(memory, addr, MemoryAccessKind::Write)?;
+            memory
+                .write_u32_checked(pa, self.regs[rm])
+                .map_err(|_| FaultKind::Translation)?;
+            self.regs[rd] = old;
+        }
+
+        Ok(true)
+    }
+
+    fn exec_block_data_transfer(
+        &mut self,
+        opcode: u32,
+        memory: &mut Memory,
+    ) -> std::result::Result<bool, FaultKind> {
+        let pre_index = ((opcode >> 24) & 1) == 1;
+        let add = ((opcode >> 23) & 1) == 1;
+        let user_mode = ((opcode >> 22) & 1) == 1;
+        let write_back = ((opcode >> 21) & 1) == 1;
+        let load = ((opcode >> 20) & 1) == 1;
+        let rn = ((opcode >> 16) & 0xF) as usize;
+        let reg_list = opcode & 0xFFFF;
+
+        if reg_list == 0 || user_mode {
+            return Ok(false);
+        }
+
+        let count = reg_list.count_ones();
+        let base = self.regs[rn];
+        let mut addr = match (add, pre_index) {
+            (true, true) => base.wrapping_add(4),
+            (true, false) => base,
+            (false, true) => base.wrapping_sub(4),
+            (false, false) => base.wrapping_sub((count.wrapping_sub(1)).wrapping_mul(4)),
+        };
+
+        for reg in 0..16 {
+            if (reg_list & (1 << reg)) == 0 {
+                continue;
+            }
+            if (addr & 3) != 0 {
+                return Err(FaultKind::Alignment);
+            }
+
+            if load {
+                let pa = self.translate_va(memory, addr, MemoryAccessKind::Read)?;
+                let value = memory
+                    .read_u32_checked(pa)
+                    .map_err(|_| FaultKind::Translation)?;
+                self.regs[reg as usize] = value;
+            } else {
+                let pa = self.translate_va(memory, addr, MemoryAccessKind::Write)?;
+                let value = if reg as usize == PC_INDEX {
+                    self.regs[PC_INDEX].wrapping_add(4)
+                } else {
+                    self.regs[reg as usize]
+                };
+                memory
+                    .write_u32_checked(pa, value)
+                    .map_err(|_| FaultKind::Translation)?;
+            }
+            addr = addr.wrapping_add(4);
+        }
+
+        if write_back {
+            let delta = count.wrapping_mul(4);
+            self.regs[rn] = if add {
+                base.wrapping_add(delta)
+            } else {
+                base.wrapping_sub(delta)
+            };
+        }
+
+        if load && (reg_list & (1 << PC_INDEX)) != 0 {
+            self.set_thumb_state((self.regs[PC_INDEX] & 1) != 0);
+            self.regs[PC_INDEX] &= !1;
+        }
+
+        Ok(true)
+    }
+
     fn exec_data_processing(&mut self, opcode: u32) -> bool {
         let immediate = ((opcode >> 25) & 1) == 1;
         let op = (opcode >> 21) & 0xF;
@@ -888,7 +1024,11 @@ impl Arm11Cpu {
             0b10 => {
                 let s = if offset == 0 { 32 } else { offset };
                 let result = if s == 32 {
-                    if (value >> 31) != 0 { u32::MAX } else { 0 }
+                    if (value >> 31) != 0 {
+                        u32::MAX
+                    } else {
+                        0
+                    }
                 } else {
                     ((value as i32) >> s) as u32
                 };
@@ -1122,7 +1262,11 @@ impl Arm11Cpu {
                 let shift = if shift_imm == 0 { 32 } else { shift_imm };
                 let sign = (value & FLAG_N) != 0;
                 let res = if shift >= 32 {
-                    if sign { u32::MAX } else { 0 }
+                    if sign {
+                        u32::MAX
+                    } else {
+                        0
+                    }
                 } else {
                     ((value as i32) >> shift) as u32
                 };
@@ -1541,5 +1685,82 @@ mod tests {
             cpu.last_exception().expect("swi exception").kind,
             ExceptionKind::SoftwareInterrupt
         ));
+    }
+    #[test]
+    fn arm_stm_and_ldm_round_trip() {
+        let mut cpu = Arm11Cpu::new();
+        let mut mem = Memory::new();
+        cpu.regs[PC_INDEX] = 0;
+        cpu.regs[0] = 0x200;
+        cpu.regs[1] = 0x1111_1111;
+        cpu.regs[2] = 0x2222_2222;
+        cpu.regs[3] = 0x3333_3333;
+
+        mem.write_u32(0, 0xE880_000E); // stm r0, {r1-r3}
+        mem.write_u32(4, 0xE890_0070); // ldm r0, {r4-r6}
+
+        cpu.step(&mut mem).expect("stm executes");
+        cpu.step(&mut mem).expect("ldm executes");
+
+        assert_eq!(mem.read_u32(0x200), 0x1111_1111);
+        assert_eq!(mem.read_u32(0x204), 0x2222_2222);
+        assert_eq!(mem.read_u32(0x208), 0x3333_3333);
+        assert_eq!(cpu.regs[4], 0x1111_1111);
+        assert_eq!(cpu.regs[5], 0x2222_2222);
+        assert_eq!(cpu.regs[6], 0x3333_3333);
+    }
+
+    #[test]
+    fn arm_swp_exchanges_register_and_memory() {
+        let mut cpu = Arm11Cpu::new();
+        let mut mem = Memory::new();
+        cpu.regs[PC_INDEX] = 0;
+        cpu.regs[0] = 0x300;
+        cpu.regs[1] = 0xAABB_CCDD;
+        mem.write_u32(0x300, 0x1122_3344);
+        mem.write_u32(0, 0xE100_1090); // swp r1, r0, [r0]
+
+        cpu.step(&mut mem).expect("swp executes");
+        assert_eq!(cpu.regs[1], 0x1122_3344);
+        assert_eq!(mem.read_u32(0x300), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn trace_fixture_matches_expected_sequence() {
+        let fixture = include_str!("../../tests_cpu_trace_fixture.txt");
+        let mut cpu = Arm11Cpu::new();
+        let mut mem = Memory::new();
+        cpu.enable_instruction_trace(8);
+        cpu.regs[PC_INDEX] = 0;
+
+        mem.write_u32(0, 0xE3A0_0001); // mov r0,#1
+        mem.write_u32(4, 0xE280_0002); // add r0,r0,#2
+        mem.write_u32(8, 0xEF00_0011); // swi
+
+        cpu.step(&mut mem).expect("step 1");
+        cpu.step(&mut mem).expect("step 2");
+        cpu.step(&mut mem).expect("step 3");
+
+        let expected: Vec<(u32, u32, bool)> = fixture
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .map(|line| {
+                let mut parts = line.split_whitespace();
+                let pc = u32::from_str_radix(parts.next().unwrap().trim_start_matches("0x"), 16)
+                    .unwrap();
+                let opcode =
+                    u32::from_str_radix(parts.next().unwrap().trim_start_matches("0x"), 16)
+                        .unwrap();
+                let thumb = parts.next().unwrap() == "1";
+                (pc, opcode, thumb)
+            })
+            .collect();
+
+        let actual: Vec<(u32, u32, bool)> = cpu
+            .instruction_trace()
+            .iter()
+            .map(|e| (e.pc, e.opcode, e.thumb))
+            .collect();
+        assert_eq!(actual, expected);
     }
 }
