@@ -34,6 +34,135 @@ enum ServiceTarget {
     Fs,
     Apt,
     GspGpu,
+    HidUser,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrvCommand {
+    RegisterService,
+    GetServiceHandle,
+}
+
+impl SrvCommand {
+    fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x0001 => Some(Self::RegisterService),
+            0x0005 => Some(Self::GetServiceHandle),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsCommand {
+    OpenArchive,
+    OpenFile,
+    ReadFile,
+}
+
+impl FsCommand {
+    fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x0001 => Some(Self::OpenArchive),
+            0x0002 => Some(Self::OpenFile),
+            0x0003 => Some(Self::ReadFile),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AptCommand {
+    GetAppState,
+    SetAppState,
+}
+
+impl AptCommand {
+    fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x0001 => Some(Self::GetAppState),
+            0x0002 => Some(Self::SetAppState),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GspCommand {
+    SetFrameClearColor,
+    QueuePixel,
+}
+
+impl GspCommand {
+    fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x0001 => Some(Self::SetFrameClearColor),
+            0x0002 => Some(Self::QueuePixel),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HidCommand {
+    Initialize,
+    GetInputState,
+    SetInputState,
+}
+
+impl HidCommand {
+    fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x0001 => Some(Self::Initialize),
+            0x000A => Some(Self::GetInputState),
+            0x000B => Some(Self::SetInputState),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServiceDefinition {
+    target: ServiceTarget,
+    max_sessions: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ServiceRegistry {
+    definitions: HashMap<String, ServiceDefinition>,
+}
+
+impl ServiceRegistry {
+    fn register(&mut self, name: &str, target: ServiceTarget, max_sessions: u32) {
+        self.definitions.insert(
+            name.to_string(),
+            ServiceDefinition {
+                target,
+                max_sessions,
+            },
+        );
+    }
+
+    fn definition(&self, name: &str) -> Option<ServiceDefinition> {
+        self.definitions.get(name).copied()
+    }
+
+    fn bootstrap() -> Self {
+        let mut registry = Self::default();
+        registry.register("srv:", ServiceTarget::Srv, 16);
+        registry.register("fs:USER", ServiceTarget::Fs, 8);
+        registry.register("apt:u", ServiceTarget::Apt, 4);
+        registry.register("gsp::Gpu", ServiceTarget::GspGpu, 4);
+        registry.register("hid:USER", ServiceTarget::HidUser, 4);
+        registry
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct HidInputState {
+    buttons: u32,
+    touch_x: u16,
+    touch_y: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,8 +201,10 @@ pub struct Kernel {
     next_handle: Handle,
     processes: HashMap<ProcessId, ProcessState>,
     service_ports: HashMap<String, (ProcessId, Handle)>,
+    registry: ServiceRegistry,
     app_state: u32,
     gpu_handoff: VecDeque<Vec<u32>>,
+    hid_state: HidInputState,
     vfs: VirtualFileSystem,
     last_ipc: Option<(u16, Handle, u32)>,
     last_service_imm24: Option<u32>,
@@ -85,6 +216,7 @@ impl Kernel {
         let mut kernel = Self {
             next_handle: 0x20,
             app_state: 1,
+            registry: ServiceRegistry::bootstrap(),
             vfs: VirtualFileSystem::default(),
             last_ipc: None,
             last_service_imm24: None,
@@ -97,10 +229,15 @@ impl Kernel {
     }
 
     fn bootstrap_services(&mut self, pid: ProcessId) {
-        self.register_service_port(pid, "srv:", 16);
-        self.register_service_port(pid, "fs:", 8);
-        self.register_service_port(pid, "apt:", 4);
-        self.register_service_port(pid, "gsp::Gpu", 4);
+        let definitions: Vec<(String, u32)> = self
+            .registry
+            .definitions
+            .iter()
+            .map(|(name, def)| (name.clone(), def.max_sessions))
+            .collect();
+        for (name, max_sessions) in definitions {
+            self.register_service_port(pid, &name, max_sessions);
+        }
     }
 
     pub fn reset_runtime(&mut self) {
@@ -109,8 +246,10 @@ impl Kernel {
         self.next_handle = 0x20;
         self.processes.clear();
         self.service_ports.clear();
+        self.registry = ServiceRegistry::bootstrap();
         self.app_state = 1;
         self.gpu_handoff.clear();
+        self.hid_state = HidInputState::default();
         self.vfs = VirtualFileSystem::default();
         self.last_ipc = None;
         self.last_service_imm24 = None;
@@ -218,13 +357,11 @@ impl Kernel {
         max_sessions: u32,
     ) -> Handle {
         self.ensure_process(pid);
-        let target = match name {
-            "srv:" => ServiceTarget::Srv,
-            "fs:" => ServiceTarget::Fs,
-            "apt:" => ServiceTarget::Apt,
-            "gsp::Gpu" => ServiceTarget::GspGpu,
-            _ => ServiceTarget::Srv,
-        };
+        let target = self
+            .registry
+            .definition(name)
+            .map(|def| def.target)
+            .unwrap_or(ServiceTarget::Srv);
         let _port = IpcPort {
             name: name.to_string(),
             max_sessions,
@@ -343,21 +480,24 @@ impl Kernel {
             ServiceTarget::Fs => self.dispatch_fs(pid, req.message),
             ServiceTarget::Apt => self.dispatch_apt(req.message),
             ServiceTarget::GspGpu => self.dispatch_gsp(req.message),
+            ServiceTarget::HidUser => self.dispatch_hid(req.message),
         }
     }
 
     fn dispatch_srv(&mut self, pid: ProcessId, msg: IpcMessage) -> (u32, Vec<u32>) {
-        match msg.command_id {
-            0x0001 => {
+        match SrvCommand::from_id(msg.command_id) {
+            Some(SrvCommand::RegisterService) => {
                 if msg.normal_words.len() < 3 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
                 let name = service_name_from_words(&msg.normal_words[..2]);
                 let max_sessions = msg.normal_words[2];
+                self.registry
+                    .register(&name, ServiceTarget::Srv, max_sessions);
                 let port = self.register_service_port(pid, &name, max_sessions);
                 (RESULT_OK, vec![port])
             }
-            0x0005 => {
+            Some(SrvCommand::GetServiceHandle) => {
                 if msg.normal_words.len() < 2 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
@@ -367,13 +507,13 @@ impl Kernel {
                     None => (RESULT_NOT_FOUND, vec![]),
                 }
             }
-            _ => (RESULT_INVALID_COMMAND, vec![]),
+            None => (RESULT_INVALID_COMMAND, vec![]),
         }
     }
 
     fn dispatch_fs(&mut self, pid: ProcessId, msg: IpcMessage) -> (u32, Vec<u32>) {
-        match msg.command_id {
-            0x0001 => {
+        match FsCommand::from_id(msg.command_id) {
+            Some(FsCommand::OpenArchive) => {
                 let archive_id = msg
                     .normal_words
                     .first()
@@ -385,7 +525,7 @@ impl Kernel {
                 let archive = self.allocate_handle(pid, KernelObject::Archive(archive_obj));
                 (RESULT_OK, vec![archive])
             }
-            0x0002 => {
+            Some(FsCommand::OpenFile) => {
                 if msg.normal_words.len() < 2 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
@@ -414,24 +554,40 @@ impl Kernel {
                 let file = self.allocate_handle(pid, KernelObject::File(file_obj));
                 (RESULT_OK, vec![file])
             }
-            _ => (RESULT_INVALID_COMMAND, vec![]),
+            Some(FsCommand::ReadFile) => {
+                if msg.normal_words.len() < 3 {
+                    return (RESULT_INVALID_COMMAND, vec![]);
+                }
+                let file_handle = msg.normal_words[0];
+                let offset = msg.normal_words[1] as usize;
+                let size = msg.normal_words[2] as usize;
+                let Some(KernelObject::File(file_obj)) = self.lookup_object(pid, file_handle)
+                else {
+                    return (RESULT_INVALID_HANDLE, vec![]);
+                };
+                let Some(data) = self.vfs.read_file(&file_obj, offset, size) else {
+                    return (RESULT_NOT_FOUND, vec![]);
+                };
+                (RESULT_OK, vec![data.len() as u32])
+            }
+            None => (RESULT_INVALID_COMMAND, vec![]),
         }
     }
 
     fn dispatch_apt(&mut self, msg: IpcMessage) -> (u32, Vec<u32>) {
-        match msg.command_id {
-            0x0001 => (RESULT_OK, vec![self.app_state]),
-            0x0002 => {
+        match AptCommand::from_id(msg.command_id) {
+            Some(AptCommand::GetAppState) => (RESULT_OK, vec![self.app_state]),
+            Some(AptCommand::SetAppState) => {
                 self.app_state = msg.normal_words.first().copied().unwrap_or(self.app_state);
                 (RESULT_OK, vec![self.app_state])
             }
-            _ => (RESULT_INVALID_COMMAND, vec![]),
+            None => (RESULT_INVALID_COMMAND, vec![]),
         }
     }
 
     fn dispatch_gsp(&mut self, msg: IpcMessage) -> (u32, Vec<u32>) {
-        match msg.command_id {
-            0x0001 => {
+        match GspCommand::from_id(msg.command_id) {
+            Some(GspCommand::SetFrameClearColor) => {
                 let color = msg.normal_words.first().copied().unwrap_or(0xFF00_0000);
                 self.gpu_handoff.push_back(vec![
                     PicaCommandBufferPacket::encode(0x0200, 1, false),
@@ -439,7 +595,7 @@ impl Kernel {
                 ]);
                 (RESULT_OK, vec![])
             }
-            0x0002 => {
+            Some(GspCommand::QueuePixel) => {
                 if msg.normal_words.len() < 3 {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
@@ -451,7 +607,34 @@ impl Kernel {
                 ]);
                 (RESULT_OK, vec![])
             }
-            _ => (RESULT_INVALID_COMMAND, vec![]),
+            None => (RESULT_INVALID_COMMAND, vec![]),
+        }
+    }
+
+    fn dispatch_hid(&mut self, msg: IpcMessage) -> (u32, Vec<u32>) {
+        match HidCommand::from_id(msg.command_id) {
+            Some(HidCommand::Initialize) => {
+                self.hid_state = HidInputState::default();
+                (RESULT_OK, vec![1])
+            }
+            Some(HidCommand::GetInputState) => (
+                RESULT_OK,
+                vec![
+                    self.hid_state.buttons,
+                    u32::from(self.hid_state.touch_x),
+                    u32::from(self.hid_state.touch_y),
+                ],
+            ),
+            Some(HidCommand::SetInputState) => {
+                if msg.normal_words.len() < 3 {
+                    return (RESULT_INVALID_COMMAND, vec![]);
+                }
+                self.hid_state.buttons = msg.normal_words[0];
+                self.hid_state.touch_x = msg.normal_words[1] as u16;
+                self.hid_state.touch_y = msg.normal_words[2] as u16;
+                (RESULT_OK, vec![])
+            }
+            None => (RESULT_INVALID_COMMAND, vec![]),
         }
     }
 }
@@ -502,7 +685,7 @@ mod tests {
         kernel.ensure_process(pid);
 
         let srv = kernel.connect_to_service(pid, "srv:").expect("srv session");
-        let fs_name = service_name_words("fs:");
+        let fs_name = service_name_words("fs:USER");
         kernel.queue_ipc_command(pid, srv, mk_command(0x0005, &fs_name));
         kernel.pump_ipc_events(1);
         let fs = kernel.pop_ipc_response(pid).expect("fs response").words[0];
@@ -517,7 +700,7 @@ mod tests {
         assert_eq!(file.result_code, RESULT_OK);
         assert_eq!(file.words.len(), 1);
 
-        let apt_name = service_name_words("apt:");
+        let apt_name = service_name_words("apt:u");
         kernel.queue_ipc_command(pid, srv, mk_command(0x0005, &apt_name));
         kernel.pump_ipc_events(1);
         let apt = kernel.pop_ipc_response(pid).expect("apt").words[0];
@@ -576,9 +759,93 @@ mod tests {
         assert!(kernel.close_handle(pid, srv));
         assert_eq!(kernel.handle_type(pid, srv), None);
 
-        kernel.queue_ipc_command(pid, srv, mk_command(0x0005, &service_name_words("fs:")));
+        kernel.queue_ipc_command(pid, srv, mk_command(0x0005, &service_name_words("fs:USER")));
         kernel.pump_ipc_events(1);
         let failed = kernel.pop_ipc_response(pid).expect("response after close");
         assert_eq!(failed.result_code, RESULT_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn hid_user_tracks_minimal_input_state() {
+        let mut kernel = Kernel::new();
+        let pid = 91;
+        kernel.ensure_process(pid);
+
+        let srv = kernel.connect_to_service(pid, "srv:").expect("srv session");
+        kernel.queue_ipc_command(
+            pid,
+            srv,
+            mk_command(0x0005, &service_name_words("hid:USER")),
+        );
+        kernel.pump_ipc_events(1);
+        let hid = kernel.pop_ipc_response(pid).expect("hid handle").words[0];
+
+        kernel.queue_ipc_command(pid, hid, mk_command(0x0001, &[]));
+        kernel.queue_ipc_command(pid, hid, mk_command(0x000B, &[0x12, 320, 120]));
+        kernel.queue_ipc_command(pid, hid, mk_command(0x000A, &[]));
+        kernel.pump_ipc_events(3);
+        assert_eq!(
+            kernel.pop_ipc_response(pid).expect("init").result_code,
+            RESULT_OK
+        );
+        assert_eq!(
+            kernel.pop_ipc_response(pid).expect("set").result_code,
+            RESULT_OK
+        );
+        let state = kernel.pop_ipc_response(pid).expect("get");
+        assert_eq!(state.result_code, RESULT_OK);
+        assert_eq!(state.words, vec![0x12, 320, 120]);
+    }
+
+    #[test]
+    fn boot_sequence_replay_for_target_title_services() {
+        let mut kernel = Kernel::new();
+        let pid = 123;
+        kernel.ensure_process(pid);
+
+        let srv = kernel.connect_to_service(pid, "srv:").expect("srv session");
+        let service_names = ["fs:USER", "apt:u", "gsp::Gpu", "hid:USER"];
+        let mut handles = HashMap::new();
+
+        for service in service_names {
+            kernel.queue_ipc_command(pid, srv, mk_command(0x0005, &service_name_words(service)));
+            kernel.pump_ipc_events(1);
+            let response = kernel
+                .pop_ipc_response(pid)
+                .expect("service handle response");
+            assert_eq!(response.result_code, RESULT_OK);
+            handles.insert(service, response.words[0]);
+        }
+
+        let fs = handles["fs:USER"];
+        kernel.queue_ipc_command(pid, fs, mk_command(0x0001, &[0]));
+        kernel.pump_ipc_events(1);
+        let archive = kernel.pop_ipc_response(pid).expect("archive response");
+        assert_eq!(archive.result_code, RESULT_OK);
+
+        let archive_handle = archive.words[0];
+        kernel.queue_ipc_command(pid, fs, mk_command(0x0002, &[archive_handle, 0x2000]));
+        kernel.pump_ipc_events(1);
+        let file = kernel.pop_ipc_response(pid).expect("file response");
+        assert_eq!(file.result_code, RESULT_OK);
+
+        let file_handle = file.words[0];
+        kernel.queue_ipc_command(pid, fs, mk_command(0x0003, &[file_handle, 0, 0x40]));
+
+        let apt = handles["apt:u"];
+        kernel.queue_ipc_command(pid, apt, mk_command(0x0001, &[]));
+
+        let gsp = handles["gsp::Gpu"];
+        kernel.queue_ipc_command(pid, gsp, mk_command(0x0001, &[0xFF00_FF00]));
+
+        let hid = handles["hid:USER"];
+        kernel.queue_ipc_command(pid, hid, mk_command(0x0001, &[]));
+        kernel.queue_ipc_command(pid, hid, mk_command(0x000A, &[]));
+
+        kernel.pump_ipc_events(5);
+        for _ in 0..5 {
+            let response = kernel.pop_ipc_response(pid).expect("ordered response");
+            assert_eq!(response.result_code, RESULT_OK);
+        }
     }
 }
