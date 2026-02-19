@@ -24,8 +24,16 @@ pub enum EmulatorError {
     },
     RomNotLoaded,
     InvalidTitlePackage,
-    InvalidRomLayout,
+    TitlePackageFormatDeprecated,
+    InvalidNcsdHeader,
+    InvalidNcchHeader,
     InvalidExHeader,
+    InvalidExeFs,
+    InvalidRomFs,
+    UnsupportedNcchCrypto,
+    MissingCodeSection,
+    InvalidSectionLayout,
+    EntrypointOutsideText,
     MmuTranslationFault {
         pc: u32,
         va: u32,
@@ -75,8 +83,28 @@ impl Display for EmulatorError {
             }
             Self::RomNotLoaded => write!(f, "cannot execute because no ROM is loaded"),
             Self::InvalidTitlePackage => write!(f, "invalid title package format"),
-            Self::InvalidRomLayout => write!(f, "invalid NCSD/NCCH ROM layout"),
+            Self::TitlePackageFormatDeprecated => {
+                write!(
+                    f,
+                    "legacy 3DST title packages are deprecated; pass NCSD/CCI bytes"
+                )
+            }
+            Self::InvalidNcsdHeader => write!(f, "invalid NCSD header/layout"),
+            Self::InvalidNcchHeader => write!(f, "invalid NCCH header/layout"),
             Self::InvalidExHeader => write!(f, "invalid NCCH exheader format"),
+            Self::InvalidExeFs => write!(f, "invalid ExeFS layout"),
+            Self::InvalidRomFs => write!(f, "invalid RomFS layout"),
+            Self::UnsupportedNcchCrypto => {
+                write!(
+                    f,
+                    "unsupported NCCH crypto flags (encrypted/seeded content)"
+                )
+            }
+            Self::MissingCodeSection => write!(f, "ExeFS is missing required .code section"),
+            Self::InvalidSectionLayout => write!(f, "invalid text/ro/data/bss section layout"),
+            Self::EntrypointOutsideText => {
+                write!(f, "entrypoint does not lie inside the text segment")
+            }
             Self::MmuTranslationFault { pc, va, pa, access } => {
                 write!(
                     f,
