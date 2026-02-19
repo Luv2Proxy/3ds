@@ -13,7 +13,6 @@ use super::kernel::{Kernel, ServiceEvent};
 use super::loader::{install_process_image, parse_process_image_from_rom};
 use super::memory::Memory;
 use super::pica::PicaGpu;
-use super::rom::RomImage;
 use super::scheduler::{ScheduledDeviceEvent, Scheduler};
 use super::timing::{DriftCorrectionPolicy, TimingModel, TimingSnapshot};
 
@@ -122,12 +121,11 @@ impl Emulator3ds {
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
-        RomImage::parse(rom, usize::MAX)?;
         self.memory.clear_writable();
         let loaded = parse_process_image_from_rom(rom)?;
-        install_process_image(&mut self.memory, &loaded.boot);
+        install_process_image(&mut self.memory, &loaded.process)?;
         self.vfs = loaded.vfs;
-        self.cpu.reset(loaded.boot.entrypoint);
+        self.cpu.reset(loaded.process.entrypoint);
         self.scheduler.reset();
         self.irq.reset();
         self.dma.reset();
@@ -144,14 +142,7 @@ impl Emulator3ds {
 
     pub fn load_title_package(&mut self, package: &[u8]) -> Result<()> {
         let title = TitlePackage::parse(package)?;
-        let first = title
-            .contents()
-            .first()
-            .ok_or(EmulatorError::InvalidTitlePackage)?;
-        let rom = title
-            .content_bytes(first.id)
-            .ok_or(EmulatorError::InvalidTitlePackage)?;
-        self.load_rom(rom)
+        self.load_rom(title.primary_rom())
     }
 
     pub fn enqueue_gpu_fifo_words(&mut self, words: &[u32]) {
@@ -688,17 +679,7 @@ mod tests {
         write_insn(&mut rom, 0xA00, 0xEF00_0000);
         write_insn(&mut rom, 0xA04, 0xE320_F003);
 
-        let mut pkg = vec![];
-        pkg.extend_from_slice(b"3DST");
-        pkg.extend_from_slice(&1u32.to_le_bytes());
-        let offset = 20u32;
-        pkg.extend_from_slice(&7u32.to_le_bytes());
-        pkg.extend_from_slice(&offset.to_le_bytes());
-        pkg.extend_from_slice(&(rom.len() as u32).to_le_bytes());
-        pkg.resize(offset as usize, 0);
-        pkg.extend_from_slice(&rom);
-
-        emu.load_title_package(&pkg)
+        emu.load_title_package(&rom)
             .unwrap_or_else(|e| panic!("load title works: {e}"));
         emu.enqueue_gpu_fifo_words(&[
             PicaCommandBufferPacket::encode(0x0301, 1, false),
