@@ -30,6 +30,8 @@ pub struct Mmu {
     control: u32,
     ttbr0: u32,
     dacr: u32,
+    icache_enabled: bool,
+    dcache_enabled: bool,
     tlb: HashMap<u32, TlbEntry>,
 }
 
@@ -45,6 +47,8 @@ impl Mmu {
             control: 0,
             ttbr0: 0,
             dacr: 0,
+            icache_enabled: false,
+            dcache_enabled: false,
             tlb: HashMap::new(),
         }
     }
@@ -53,13 +57,22 @@ impl Mmu {
         self.control = 0;
         self.ttbr0 = 0;
         self.dacr = 0;
+        self.icache_enabled = false;
+        self.dcache_enabled = false;
         self.tlb.clear();
     }
 
     pub fn write_control(&mut self, value: u32) {
         let old_enabled = self.mmu_enabled();
+        let old_icache = self.icache_enabled;
+        let old_dcache = self.dcache_enabled;
         self.control = value;
-        if old_enabled != self.mmu_enabled() {
+        self.icache_enabled = (value & (1 << 12)) != 0;
+        self.dcache_enabled = (value & (1 << 2)) != 0;
+        if old_enabled != self.mmu_enabled()
+            || old_icache != self.icache_enabled
+            || old_dcache != self.dcache_enabled
+        {
             self.invalidate_tlb();
         }
     }
@@ -85,6 +98,14 @@ impl Mmu {
 
     pub fn mmu_enabled(&self) -> bool {
         (self.control & 1) != 0
+    }
+
+    pub fn icache_enabled(&self) -> bool {
+        self.icache_enabled
+    }
+
+    pub fn dcache_enabled(&self) -> bool {
+        self.dcache_enabled
     }
 
     pub fn translate_instruction(
@@ -320,6 +341,20 @@ mod tests {
                 access: MemoryAccessKind::Execute,
             }
         );
+    }
+
+    #[test]
+    fn control_write_updates_cache_state() {
+        let mut mmu = Mmu::new();
+        mmu.write_control((1 << 12) | (1 << 2) | 1);
+        assert!(mmu.mmu_enabled());
+        assert!(mmu.icache_enabled());
+        assert!(mmu.dcache_enabled());
+
+        mmu.write_control(0);
+        assert!(!mmu.mmu_enabled());
+        assert!(!mmu.icache_enabled());
+        assert!(!mmu.dcache_enabled());
     }
 
     #[test]
