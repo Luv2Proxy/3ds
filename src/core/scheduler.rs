@@ -3,6 +3,7 @@ pub enum ScheduledDeviceEvent {
     TimerExpiry,
     VBlank,
     DmaCompletion { channel: u8 },
+    ServiceWake { pid: u32 },
 }
 
 impl ScheduledDeviceEvent {
@@ -11,6 +12,7 @@ impl ScheduledDeviceEvent {
             ScheduledDeviceEvent::TimerExpiry => 0,
             ScheduledDeviceEvent::VBlank => 1,
             ScheduledDeviceEvent::DmaCompletion { .. } => 2,
+            ScheduledDeviceEvent::ServiceWake { .. } => 3,
         }
     }
 }
