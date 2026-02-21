@@ -3,6 +3,7 @@ pub enum IrqLine {
     Timer0 = 0,
     VBlank = 1,
     Dma0 = 2,
+    Gpu = 3,
 }
 
 impl IrqLine {
@@ -57,6 +58,9 @@ impl IrqController {
         }
         if active & IrqLine::Dma0.bit() != 0 {
             return Some(IrqLine::Dma0);
+        }
+        if active & IrqLine::Gpu.bit() != 0 {
+            return Some(IrqLine::Gpu);
         }
         None
     }

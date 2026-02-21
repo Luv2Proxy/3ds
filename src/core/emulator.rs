@@ -331,6 +331,14 @@ impl Emulator3ds {
                     .mark(BootCheckpoint::FirstGpuCommand, self.scheduler.cycles());
             }
             self.last_gpu_trace_len = self.gpu.trace().len();
+            for event in self.gpu.take_events() {
+                match event {
+                    super::pica::GpuEvent::FrameComplete => {
+                        self.irq.raise(IrqLine::Gpu);
+                        self.kernel.signal_gpu_frame_complete();
+                    }
+                }
+            }
             if timing_tick.video_frames > 0 {
                 self.gpu.present(timing_tick.video_frames);
                 self.frame_callbacks = self
