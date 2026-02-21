@@ -1,4 +1,4 @@
-use super::memory::Memory;
+use super::bus::Bus;
 use super::pica::PicaGpu;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,7 @@ impl DmaEngine {
     pub fn complete_transfer(
         &mut self,
         channel: u8,
-        memory: &mut Memory,
+        memory: &mut dyn Bus,
         gpu: &mut PicaGpu,
     ) -> bool {
         let Some(idx) = self.in_flight.iter().position(|t| t.channel == channel) else {

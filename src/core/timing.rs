@@ -21,11 +21,19 @@ pub struct ScreenTimingSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingEvent {
+    VBlank,
+    Frame,
+    AudioSample,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimingTick {
     pub audio_samples: u64,
     pub video_frames: u64,
     pub top_vblank_edges: u64,
     pub bottom_vblank_edges: u64,
+    pub events: Vec<TimingEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,11 +155,17 @@ impl TimingModel {
         self.top_vblank_count = self.top_vblank_count.saturating_add(top_edges);
         self.bottom_vblank_count = self.bottom_vblank_count.saturating_add(bottom_edges);
 
+        let mut events = Vec::new();
+        events.extend((0..produced_samples).map(|_| TimingEvent::AudioSample));
+        events.extend((0..produced_frames).map(|_| TimingEvent::Frame));
+        events.extend((0..top_edges).map(|_| TimingEvent::VBlank));
+
         TimingTick {
             audio_samples: produced_samples,
             video_frames: produced_frames,
             top_vblank_edges: top_edges,
             bottom_vblank_edges: bottom_edges,
+            events,
         }
     }
 

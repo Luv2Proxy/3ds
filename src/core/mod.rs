@@ -1,3 +1,4 @@
+pub mod bus;
 pub mod cpu;
 pub mod diagnostics;
 pub mod dma;
@@ -8,6 +9,7 @@ pub mod fs;
 pub mod ipc;
 pub mod irq;
 pub mod kernel;
+#[path = "loader/mod.rs"]
 pub mod loader;
 pub mod memory;
 pub mod mmu;
@@ -16,3 +18,4 @@ pub mod rom;
 pub mod scheduler;
 pub mod services;
 pub mod timing;
+pub mod trace;
