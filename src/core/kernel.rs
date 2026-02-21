@@ -3,8 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use super::diagnostics::StructuredError;
 use super::fs::{ArchiveHandle, FileHandle, VirtualFileSystem};
 use super::ipc::{
-    service_name_from_words, Handle, IpcEvent, IpcMessage, KernelObjectType, ProcessId,
-    RESULT_INVALID_COMMAND, RESULT_INVALID_HANDLE, RESULT_NOT_FOUND,
+    Handle, IpcEvent, IpcMessage, KernelObjectType, ProcessId, RESULT_INVALID_COMMAND,
+    RESULT_INVALID_HANDLE, RESULT_NOT_FOUND, service_name_from_words,
 };
 use super::pica::PicaCommandBufferPacket;
 use super::services::{ServiceRegistry, ServiceRuntime, ServiceTarget};
@@ -519,7 +519,7 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ipc::{service_name_words, IpcMessage, RESULT_INVALID_HANDLE, RESULT_OK};
+    use crate::core::ipc::{IpcMessage, RESULT_INVALID_HANDLE, RESULT_OK, service_name_words};
 
     fn mk_command(command_id: u16, payload: &[u32]) -> Vec<u32> {
         IpcMessage {

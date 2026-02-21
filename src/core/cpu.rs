@@ -1,8 +1,8 @@
+use super::bus::Bus;
 use super::error::EmulatorError;
 use super::error::MemoryAccessKind;
 use super::error::Result;
 use super::irq::IrqLine;
-use super::memory::Memory;
 use super::mmu::Mmu;
 
 const REG_COUNT: usize = 16;
@@ -225,7 +225,7 @@ impl Arm11Cpu {
         self.take_exception(ExceptionKind::Interrupt(line), pc, line as u32, true);
     }
 
-    pub fn step(&mut self, memory: &mut Memory) -> Result<u32> {
+    pub fn step(&mut self, memory: &mut dyn Bus) -> Result<u32> {
         self.last_trace_entry = None;
         self.last_mmu_fault = None;
         if self.state == CpuRunState::Halted {
@@ -239,7 +239,7 @@ impl Arm11Cpu {
         }
     }
 
-    fn step_arm(&mut self, memory: &mut Memory) -> Result<u32> {
+    fn step_arm(&mut self, memory: &mut dyn Bus) -> Result<u32> {
         let pc = self.pc();
         let opcode = match self.fetch_instruction(memory, pc) {
             Ok(op) => op,
@@ -300,7 +300,10 @@ impl Arm11Cpu {
             };
         }
 
-        if (opcode >> 25) & 0x7 == 0b000 && (opcode & 0x90) == 0x90 {
+        if (opcode >> 25) & 0x7 == 0b000
+            && (opcode & 0x90) == 0x90
+            && (opcode & 0x0FB0_0FF0) != 0x0100_0090
+        {
             return match self.exec_halfword_data_transfer(opcode, memory) {
                 Ok(true) => Ok(3),
                 Ok(false) => Ok(1),
@@ -335,7 +338,7 @@ impl Arm11Cpu {
         Ok(3)
     }
 
-    fn step_thumb(&mut self, memory: &mut Memory) -> Result<u32> {
+    fn step_thumb(&mut self, memory: &mut dyn Bus) -> Result<u32> {
         let pc = self.pc();
         let opcode = match self.fetch_thumb_instruction(memory, pc) {
             Ok(op) => op,
@@ -388,7 +391,7 @@ impl Arm11Cpu {
 
     fn fetch_instruction(
         &mut self,
-        memory: &Memory,
+        memory: &mut dyn Bus,
         va: u32,
     ) -> std::result::Result<u32, FaultKind> {
         if va & 3 != 0 {
@@ -402,7 +405,7 @@ impl Arm11Cpu {
 
     fn fetch_thumb_instruction(
         &mut self,
-        memory: &Memory,
+        memory: &mut dyn Bus,
         va: u32,
     ) -> std::result::Result<u16, FaultKind> {
         if va & 1 != 0 {
@@ -420,7 +423,7 @@ impl Arm11Cpu {
 
     fn translate_instruction_va(
         &mut self,
-        memory: &Memory,
+        memory: &mut dyn Bus,
         va: u32,
     ) -> std::result::Result<u32, FaultKind> {
         self.mmu
@@ -439,7 +442,7 @@ impl Arm11Cpu {
 
     fn translate_va(
         &mut self,
-        memory: &Memory,
+        memory: &mut dyn Bus,
         va: u32,
         access: MemoryAccessKind,
     ) -> std::result::Result<u32, FaultKind> {
@@ -526,7 +529,7 @@ impl Arm11Cpu {
         false
     }
 
-    fn exec_coprocessor(&mut self, opcode: u32, _memory: &mut Memory) -> bool {
+    fn exec_coprocessor(&mut self, opcode: u32, _memory: &mut dyn Bus) -> bool {
         if (opcode & 0x0F00_0010) == 0x0E00_0010 {
             let cp_num = (opcode >> 8) & 0xF;
             let rd = ((opcode >> 12) & 0xF) as usize;
@@ -609,7 +612,7 @@ impl Arm11Cpu {
     fn exec_single_data_transfer(
         &mut self,
         opcode: u32,
-        memory: &mut Memory,
+        memory: &mut dyn Bus,
     ) -> std::result::Result<(), FaultKind> {
         let immediate_offset = ((opcode >> 25) & 1) == 0;
         let pre_index = ((opcode >> 24) & 1) == 1;
@@ -676,7 +679,7 @@ impl Arm11Cpu {
     fn exec_halfword_data_transfer(
         &mut self,
         opcode: u32,
-        memory: &mut Memory,
+        memory: &mut dyn Bus,
     ) -> std::result::Result<bool, FaultKind> {
         if (opcode & 0x0E00_0090) != 0x0000_0090 {
             return Ok(false);
@@ -755,7 +758,7 @@ impl Arm11Cpu {
     fn exec_swap(
         &mut self,
         opcode: u32,
-        memory: &mut Memory,
+        memory: &mut dyn Bus,
     ) -> std::result::Result<bool, FaultKind> {
         if opcode & 0x0FB0_0FF0 != 0x0100_0090 {
             return Ok(false);
@@ -798,7 +801,7 @@ impl Arm11Cpu {
     fn exec_block_data_transfer(
         &mut self,
         opcode: u32,
-        memory: &mut Memory,
+        memory: &mut dyn Bus,
     ) -> std::result::Result<bool, FaultKind> {
         let pre_index = ((opcode >> 24) & 1) == 1;
         let add = ((opcode >> 23) & 1) == 1;
@@ -1024,11 +1027,7 @@ impl Arm11Cpu {
             0b10 => {
                 let s = if offset == 0 { 32 } else { offset };
                 let result = if s == 32 {
-                    if (value >> 31) != 0 {
-                        u32::MAX
-                    } else {
-                        0
-                    }
+                    if (value >> 31) != 0 { u32::MAX } else { 0 }
                 } else {
                     ((value as i32) >> s) as u32
                 };
@@ -1140,7 +1139,7 @@ impl Arm11Cpu {
         true
     }
 
-    fn exec_thumb_ldr_literal(&mut self, opcode: u16, memory: &mut Memory, pc: u32) -> bool {
+    fn exec_thumb_ldr_literal(&mut self, opcode: u16, memory: &mut dyn Bus, pc: u32) -> bool {
         if (opcode & 0xF800) != 0x4800 {
             return false;
         }
@@ -1165,7 +1164,7 @@ impl Arm11Cpu {
         true
     }
 
-    fn exec_thumb_load_store_imm(&mut self, opcode: u16, memory: &mut Memory, pc: u32) -> bool {
+    fn exec_thumb_load_store_imm(&mut self, opcode: u16, memory: &mut dyn Bus, pc: u32) -> bool {
         if (opcode & 0xE000) != 0x6000 {
             return false;
         }
@@ -1262,11 +1261,7 @@ impl Arm11Cpu {
                 let shift = if shift_imm == 0 { 32 } else { shift_imm };
                 let sign = (value & FLAG_N) != 0;
                 let res = if shift >= 32 {
-                    if sign {
-                        u32::MAX
-                    } else {
-                        0
-                    }
+                    if sign { u32::MAX } else { 0 }
                 } else {
                     ((value as i32) >> shift) as u32
                 };
@@ -1451,6 +1446,7 @@ impl Arm11Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::memory::Memory;
 
     fn mcr_cp15(crn: u32, rd: usize, crm: u32, opc2: u32) -> u32 {
         0xEE00_0010 | (crn << 16) | ((rd as u32) << 12) | (15 << 8) | (opc2 << 5) | crm
@@ -1494,7 +1490,7 @@ mod tests {
         cpu.exec_coprocessor(mcr_cp15(1, 0, 0, 0), &mut memory);
 
         cpu.mmu
-            .translate(&memory, 0x0000_1000, MemoryAccessKind::Read, true)
+            .translate(&mut memory, 0x0000_1000, MemoryAccessKind::Read, true)
             .unwrap_or_else(|e| panic!("initial translation: {e}"));
         assert_eq!(cpu.mmu.tlb_len(), 1);
 
@@ -1718,11 +1714,11 @@ mod tests {
         cpu.regs[0] = 0x300;
         cpu.regs[1] = 0xAABB_CCDD;
         mem.write_u32(0x300, 0x1122_3344);
-        mem.write_u32(0, 0xE100_1090); // swp r1, r0, [r0]
+        mem.write_u32(0, 0xE100_1091); // swp r1, r1, [r0]
 
         cpu.step(&mut mem).expect("swp executes");
-        assert_eq!(cpu.regs[1], 0x1122_3344);
-        assert_eq!(mem.read_u32(0x300), 0xAABB_CCDD);
+        assert_eq!(cpu.regs[1], 0xAABB_CCDD);
+        assert_eq!(mem.read_u32(0x300), 0x1122_3344);
     }
 
     #[test]

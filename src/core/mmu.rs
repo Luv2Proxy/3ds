@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use super::bus::Bus;
 use super::error::{EmulatorError, MemoryAccessKind, Result};
-use super::memory::Memory;
 
 const SECTION_DESCRIPTOR_MASK: u32 = 0b11;
 const SECTION_DESCRIPTOR_VALUE: u32 = 0b10;
@@ -110,24 +110,34 @@ impl Mmu {
 
     pub fn translate_instruction(
         &mut self,
-        memory: &Memory,
+        memory: &mut dyn Bus,
         va: u32,
         privileged: bool,
     ) -> Result<u32> {
         self.translate(memory, va, MemoryAccessKind::Execute, privileged)
     }
 
-    pub fn translate_read(&mut self, memory: &Memory, va: u32, privileged: bool) -> Result<u32> {
+    pub fn translate_read(
+        &mut self,
+        memory: &mut dyn Bus,
+        va: u32,
+        privileged: bool,
+    ) -> Result<u32> {
         self.translate(memory, va, MemoryAccessKind::Read, privileged)
     }
 
-    pub fn translate_write(&mut self, memory: &Memory, va: u32, privileged: bool) -> Result<u32> {
+    pub fn translate_write(
+        &mut self,
+        memory: &mut dyn Bus,
+        va: u32,
+        privileged: bool,
+    ) -> Result<u32> {
         self.translate(memory, va, MemoryAccessKind::Write, privileged)
     }
 
     pub fn translate(
         &mut self,
-        memory: &Memory,
+        memory: &mut dyn Bus,
         va: u32,
         access: MemoryAccessKind,
         privileged: bool,
@@ -237,6 +247,7 @@ impl Mmu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::memory::Memory;
 
     fn section_desc(pa_base: u32, domain: u32, ap: u32) -> u32 {
         (pa_base & SECTION_BASE_MASK) | (domain << 5) | (ap << 10) | SECTION_DESCRIPTOR_VALUE
@@ -255,7 +266,7 @@ mod tests {
         mmu.write_control(1);
 
         let pa = mmu
-            .translate(&memory, 0x0000_1234, MemoryAccessKind::Read, false)
+            .translate(&mut memory, 0x0000_1234, MemoryAccessKind::Read, false)
             .unwrap_or_else(|e| panic!("translation should succeed: {e}"));
         assert_eq!(pa, 0x0800_1234);
         assert_eq!(mmu.tlb_len(), 1);
@@ -263,14 +274,14 @@ mod tests {
 
     #[test]
     fn faults_on_unmapped_section() {
-        let memory = Memory::new();
+        let mut memory = Memory::new();
         let mut mmu = Mmu::new();
         mmu.write_ttbr0(0x0000_4000);
         mmu.write_dacr(0b01);
         mmu.write_control(1);
 
         let err = mmu
-            .translate(&memory, 0x0020_0000, MemoryAccessKind::Read, false)
+            .translate(&mut memory, 0x0020_0000, MemoryAccessKind::Read, false)
             .err()
             .unwrap_or_else(|| panic!("expected translation fault"));
         assert_eq!(
@@ -297,7 +308,7 @@ mod tests {
         mmu.write_control(1);
 
         let user_err = mmu
-            .translate(&memory, 0x0000_1000, MemoryAccessKind::Read, false)
+            .translate(&mut memory, 0x0000_1000, MemoryAccessKind::Read, false)
             .err()
             .unwrap_or_else(|| panic!("expected user permission fault"));
         assert_eq!(
@@ -311,7 +322,7 @@ mod tests {
         );
 
         let pa = mmu
-            .translate(&memory, 0x0000_1000, MemoryAccessKind::Read, true)
+            .translate(&mut memory, 0x0000_1000, MemoryAccessKind::Read, true)
             .unwrap_or_else(|e| panic!("privileged read should succeed: {e}"));
         assert_eq!(pa, 0x0010_1000);
     }
@@ -329,7 +340,7 @@ mod tests {
         mmu.write_control(1);
 
         let err = mmu
-            .translate_instruction(&memory, 0x0000_1000, true)
+            .translate_instruction(&mut memory, 0x0000_1000, true)
             .err()
             .unwrap_or_else(|| panic!("expected XN permission fault"));
         assert_eq!(
@@ -370,12 +381,12 @@ mod tests {
         mmu.write_control(1);
 
         let read_pa = mmu
-            .translate_read(&memory, 0x0000_1000, false)
+            .translate_read(&mut memory, 0x0000_1000, false)
             .unwrap_or_else(|e| panic!("read should succeed: {e}"));
         assert_eq!(read_pa, 0x0010_1000);
 
         let err = mmu
-            .translate_write(&memory, 0x0000_1000, false)
+            .translate_write(&mut memory, 0x0000_1000, false)
             .err()
             .unwrap_or_else(|| panic!("expected permission fault"));
         assert_eq!(

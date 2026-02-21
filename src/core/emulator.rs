@@ -1,8 +1,5 @@
+use super::bus::{Bus, SystemBus};
 use super::cpu::{Arm11Cpu, CpuException, CpuRunState, ExceptionKind};
-use super::diagnostics::{
-    BootCheckpoint, BootCheckpointProfiler, BootCheckpointSnapshot, FaultSnapshot, RingBuffer,
-    StructuredError, TraceCategory, TracePayload, TraceRecord,
-};
 use super::dma::{DmaEngine, DmaTransfer, DmaTransferKind};
 use super::dsp::Dsp;
 use super::error::{EmulatorError, Result};
@@ -11,10 +8,13 @@ use super::fs::VirtualFileSystem;
 use super::irq::{IrqController, IrqLine};
 use super::kernel::{Kernel, ServiceEvent};
 use super::loader::{install_process_image, parse_process_image_from_rom};
-use super::memory::Memory;
 use super::pica::PicaGpu;
 use super::scheduler::{ScheduledDeviceEvent, Scheduler};
 use super::timing::{DriftCorrectionPolicy, TimingModel, TimingSnapshot};
+use super::trace::{
+    BootCheckpoint, BootCheckpointProfiler, BootCheckpointSnapshot, FaultSnapshot, RingBuffer,
+    StructuredError, TraceCategory, TracePayload, TraceRecord,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EmulatorConfig {
@@ -29,10 +29,9 @@ impl Default for EmulatorConfig {
     }
 }
 
-#[derive(Clone)]
 pub struct Emulator3ds {
     cpu: Arm11Cpu,
-    memory: Memory,
+    bus: SystemBus,
     gpu: PicaGpu,
     dsp: Dsp,
     scheduler: Scheduler,
@@ -81,7 +80,7 @@ impl Emulator3ds {
     pub fn with_config(config: EmulatorConfig) -> Self {
         Self {
             cpu: Arm11Cpu::new(),
-            memory: Memory::new(),
+            bus: SystemBus::new(),
             gpu: PicaGpu::new(),
             dsp: Dsp::new(),
             scheduler: Scheduler::new(),
@@ -106,7 +105,7 @@ impl Emulator3ds {
     }
 
     pub fn reset(&mut self) {
-        self.memory.clear_writable();
+        self.bus.memory_mut().clear_writable();
         self.scheduler.reset();
         self.irq.reset();
         self.dma.reset();
@@ -121,9 +120,9 @@ impl Emulator3ds {
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) -> Result<()> {
-        self.memory.clear_writable();
+        self.bus.memory_mut().clear_writable();
         let loaded = parse_process_image_from_rom(rom)?;
-        install_process_image(&mut self.memory, &loaded.process)?;
+        install_process_image(self.bus.memory_mut(), &loaded.process)?;
         self.vfs = loaded.vfs;
         self.cpu.reset(loaded.process.entrypoint);
         self.scheduler.reset();
@@ -193,6 +192,8 @@ impl Emulator3ds {
             TraceCategory::ServiceCall => self.service_trace.push(rec),
             TraceCategory::MmuFault => self.mmu_fault_trace.push(rec),
             TraceCategory::GpuCommand => self.gpu_trace.push(rec),
+            TraceCategory::Irq => self.service_trace.push(rec),
+            TraceCategory::Timer => self.service_trace.push(rec),
         }
     }
 
@@ -213,21 +214,43 @@ impl Emulator3ds {
     fn handle_scheduled_event(&mut self, event: ScheduledDeviceEvent) {
         match event {
             ScheduledDeviceEvent::TimerExpiry => {
+                self.record_trace(
+                    TraceCategory::Timer,
+                    TracePayload::TimerScheduled { period_cycles: 16 },
+                );
                 self.irq.raise(IrqLine::Timer0);
+                self.record_trace(
+                    TraceCategory::Irq,
+                    TracePayload::IrqRaised {
+                        line: IrqLine::Timer0 as u8,
+                    },
+                );
                 self.scheduler
                     .schedule_in(16, ScheduledDeviceEvent::TimerExpiry);
             }
             ScheduledDeviceEvent::VBlank => {
                 self.irq.raise(IrqLine::VBlank);
+                self.record_trace(
+                    TraceCategory::Irq,
+                    TracePayload::IrqRaised {
+                        line: IrqLine::VBlank as u8,
+                    },
+                );
                 self.scheduler
                     .schedule_in(4_000_000, ScheduledDeviceEvent::VBlank);
             }
             ScheduledDeviceEvent::DmaCompletion { channel } => {
                 if self
                     .dma
-                    .complete_transfer(channel, &mut self.memory, &mut self.gpu)
+                    .complete_transfer(channel, &mut self.bus, &mut self.gpu)
                 {
                     self.irq.raise(IrqLine::Dma0);
+                    self.record_trace(
+                        TraceCategory::Irq,
+                        TracePayload::IrqRaised {
+                            line: IrqLine::Dma0 as u8,
+                        },
+                    );
                 }
             }
             ScheduledDeviceEvent::ServiceWake { pid } => {
@@ -252,7 +275,7 @@ impl Emulator3ds {
                 self.cpu.enter_irq(line);
             }
 
-            let consumed = self.cpu.step(&mut self.memory)?;
+            let consumed = self.cpu.step(&mut self.bus)?;
             if let Some(entry) = self.cpu.take_last_instruction_trace() {
                 self.record_trace(
                     TraceCategory::CpuFetchDecode,
@@ -335,6 +358,12 @@ impl Emulator3ds {
                 match event {
                     super::pica::GpuEvent::FrameComplete => {
                         self.irq.raise(IrqLine::Gpu);
+                        self.record_trace(
+                            TraceCategory::Irq,
+                            TracePayload::IrqRaised {
+                                line: IrqLine::Gpu as u8,
+                            },
+                        );
                         self.kernel.signal_gpu_frame_complete();
                     }
                 }
@@ -459,23 +488,23 @@ impl Emulator3ds {
     }
 
     pub fn read_phys_u8(&self, addr: u32) -> u8 {
-        self.memory.read_u8(addr)
+        self.bus.memory().read_u8(addr)
     }
 
     pub fn write_phys_u8(&mut self, addr: u32, value: u8) {
-        self.memory.write_u8(addr, value);
+        self.bus.write_u8(addr, value);
     }
 
     pub fn read_phys_u32(&self, addr: u32) -> u32 {
-        self.memory.read_u32(addr)
+        self.bus.memory().read_u32(addr)
     }
 
     pub fn write_phys_u32(&mut self, addr: u32, value: u32) {
-        self.memory.write_u32(addr, value);
+        self.bus.write_u32(addr, value);
     }
 
     pub fn mapped_memory_bytes(&self) -> usize {
-        self.memory.len_mapped_bytes()
+        self.bus.memory().len_mapped_bytes()
     }
 
     pub fn frame_rgba(&self) -> Vec<u8> {
@@ -510,6 +539,7 @@ impl Emulator3ds {
             TraceCategory::ServiceCall => self.service_trace.recent(limit),
             TraceCategory::MmuFault => self.mmu_fault_trace.recent(limit),
             TraceCategory::GpuCommand => self.gpu_trace.recent(limit),
+            TraceCategory::Irq | TraceCategory::Timer => self.service_trace.recent(limit),
         }
     }
 
@@ -573,7 +603,7 @@ impl Emulator3ds {
         let mut checksum = 0_u64;
         for off in 0..len {
             let addr = (start as u32).checked_add(off as u32)?;
-            checksum = checksum.wrapping_add(u64::from(self.memory.read_u8(addr)));
+            checksum = checksum.wrapping_add(u64::from(self.bus.memory().read_u8(addr)));
         }
         Some(checksum)
     }

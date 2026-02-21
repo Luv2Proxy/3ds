@@ -3,14 +3,14 @@
 mod core;
 
 pub use crate::core::cpu::{CpuException, CpuRunState, ExceptionKind};
-pub use crate::core::diagnostics::{
-    BootCheckpoint, BootCheckpointSnapshot, FaultSnapshot, StructuredError, TraceCategory,
-    TracePayload, TraceRecord,
-};
 pub use crate::core::emulator::{Emulator3ds, EmulatorConfig, EmulatorState};
 pub use crate::core::error::EmulatorError;
 pub use crate::core::kernel::{ServiceCall, ServiceEvent};
 pub use crate::core::timing::{DriftCorrectionPolicy, TimingSnapshot};
+pub use crate::core::trace::{
+    BootCheckpoint, BootCheckpointSnapshot, FaultSnapshot, StructuredError, TraceCategory,
+    TracePayload, TraceRecord,
+};
 
 #[derive(Default)]
 pub struct Wasm3ds {
@@ -105,6 +105,14 @@ impl Wasm3ds {
 
     pub fn diagnostics_json(&self) -> String {
         self.inner.diagnostics_json()
+    }
+
+    pub fn recent_fault_snapshots(&self, limit: usize) -> Vec<FaultSnapshot> {
+        self.inner.recent_fault_snapshots(limit)
+    }
+
+    pub fn boot_checkpoint_snapshot(&self) -> BootCheckpointSnapshot {
+        self.inner.boot_checkpoint_snapshot()
     }
 
     pub fn reset(&mut self) {
