@@ -6,10 +6,8 @@ use super::ipc::{
     service_name_from_words, Handle, IpcEvent, IpcMessage, KernelObjectType, ProcessId,
     RESULT_INVALID_COMMAND, RESULT_INVALID_HANDLE, RESULT_NOT_FOUND,
 };
-use super::services::{
-    ServiceRegistry, ServiceRuntime, ServiceTarget,
-};
 use super::pica::PicaCommandBufferPacket;
+use super::services::{ServiceRegistry, ServiceRuntime, ServiceTarget};
 
 const KERNEL_PROCESS_ID: ProcessId = 1;
 
@@ -80,6 +78,7 @@ pub struct Kernel {
     last_service_imm24: Option<u32>,
     last_error: Option<StructuredError>,
     pending_schedule_events: VecDeque<KernelScheduleEvent>,
+    gpu_frame_completions: u64,
 }
 
 impl Kernel {
@@ -277,6 +276,13 @@ impl Kernel {
         self.last_service_imm24.take()
     }
 
+    pub fn signal_gpu_frame_complete(&mut self) {
+        self.gpu_frame_completions = self.gpu_frame_completions.saturating_add(1);
+    }
+
+    pub fn gpu_frame_completions(&self) -> u64 {
+        self.gpu_frame_completions
+    }
     pub fn report_error(&mut self, err: StructuredError) {
         self.last_error = Some(err);
     }
@@ -365,7 +371,8 @@ impl Kernel {
                 }
                 let name = service_name_from_words(&msg.normal_words[..2]);
                 let max_sessions = msg.normal_words[2];
-                self.registry.register(&name, ServiceTarget::Srv, max_sessions);
+                self.registry
+                    .register(&name, ServiceTarget::Srv, max_sessions);
                 let port = self.register_service_port(pid, &name, max_sessions, ServiceTarget::Srv);
                 (0, vec![port])
             }
@@ -398,7 +405,8 @@ impl Kernel {
                     return (RESULT_INVALID_COMMAND, vec![]);
                 }
                 let archive_handle = msg.normal_words[0];
-                let Some(KernelObject::Archive(archive_obj)) = self.lookup_object(pid, archive_handle)
+                let Some(KernelObject::Archive(archive_obj)) =
+                    self.lookup_object(pid, archive_handle)
                 else {
                     return (RESULT_INVALID_HANDLE, vec![]);
                 };
@@ -408,7 +416,10 @@ impl Kernel {
                 );
                 let file_obj = match self.vfs.open_file(archive_obj, &translated) {
                     Some(file) => file,
-                    None => match self.vfs.open_file(archive_obj, &format!("/{:08x}", msg.normal_words[1])) {
+                    None => match self
+                        .vfs
+                        .open_file(archive_obj, &format!("/{:08x}", msg.normal_words[1]))
+                    {
                         Some(file) => file,
                         None => return (RESULT_NOT_FOUND, vec![]),
                     },
@@ -423,7 +434,8 @@ impl Kernel {
                 let file_handle = msg.normal_words[0];
                 let offset = msg.normal_words[1] as usize;
                 let size = msg.normal_words[2] as usize;
-                let Some(KernelObject::File(file_obj)) = self.lookup_object(pid, file_handle) else {
+                let Some(KernelObject::File(file_obj)) = self.lookup_object(pid, file_handle)
+                else {
                     return (RESULT_INVALID_HANDLE, vec![]);
                 };
                 let Some(data) = self.vfs.read_file(&file_obj, offset, size) else {
